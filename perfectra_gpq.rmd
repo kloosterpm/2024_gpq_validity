@@ -1,0 +1,3404 @@
+---
+title: "Construct and criterion validity of the GPQ"
+author: "Peter ten Klooster"
+date: "27 August 2024"
+output:
+  html_document:
+    toc: true
+    toc_float: 
+      collapsed: true
+      smooth_scroll: true
+    theme: cerulean
+    highlight: tango
+  pdf_document: 
+    latex_engine: xelatex
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+
+
+```{r setup, include=FALSE}
+options("install.lock"=FALSE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = TRUE)
+library(tidyverse)
+library(miceafter)
+library(tinytex)
+library(dplyr)
+library(summarytools)
+library(ggplot2)
+library(sjlabelled)
+library(multcomp)
+library(fuzzyjoin)
+library(lubridate)
+library(data.table)
+library(writexl)
+library(compareGroups)
+library(corrplot)
+library(MKinfer)
+library(DescTools)
+library(naniar)
+library(nlme)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(lmtest)
+library(emmeans)
+library(ggpubr)
+library(rlang)
+library(naniar)
+library(simputation)
+library(mice)
+library(hablar)
+library(survminer)
+library(gt)
+library(psych)
+library(rstatix)
+library(grid)
+library(gridExtra)
+library(broom)
+library(tidyr)
+library(pROC)
+library(ggpubr)
+library(magick)
+```
+
+ 
+
+#### R script for manuscript on the construct and criterion validity of the GPQ. Data used from the [PERFECTRA trial](https://doi.org/10.1136/rmdopen-2024-004291).
+\ 
+
+* 21 August 2024: Started with R script 
+  + Based on PerfectRA script
+
+\ 
+
+# Patient assignment and selection
+## Included patients
+
+```{r}
+patients <- read_delim(list.files("data/", full.names = TRUE, 
+                                  pattern = "tih_patients")[[1]], 
+                       ";", escape_double = F, 
+                       col_types = cols(
+                        id = col_integer(),
+                        center_id = col_character(),
+                        birthyear = col_double(),
+                        gender = col_factor(levels = 
+                                        
+                                                    c("female","male")),
+                        unique_id = col_integer(),
+                        last_activity = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        died_on = col_datetime(format = "%Y-%m-%d %H:%M:%S"),
+                        show_prev_visits = col_double()
+                        ))
+problems(patients)
+```
+
+Clean and sort patient dataset
+
+```{r}
+patients <- 
+  patients %>% 
+  dplyr::select(id, center_id, birthyear, gender, unique_id, died_on) %>%
+  # Rename id to match with other data frames
+  rename(patient_id = id) %>%
+  # Sort by patient_id
+  arrange(patient_id)
+
+head(patients) 
+
+
+```
+
+## Treatment assignment
+Retrieve randomization information from `overview` table:
+
+```{r}
+randomization <- read_delim(list.files("data/", full.names = TRUE, 
+                                       pattern = "overview")[[1]], ";", 
+                            escape_double = F, 
+                            col_types = cols(
+                              patient_id = col_integer(), 
+                              condition = col_factor(), 
+                              start_date = col_datetime(format = "%d-%m-%Y"), 
+                              stop_date = col_datetime(format = "%d-%m-%Y"), 
+                              stop_reason = col_factor()
+                            )) %>%
+  # Sort by patient_id
+  arrange(patient_id) %>%
+  # Recode condition
+  mutate(condition = dplyr::recode(condition, 
+                          'Bari' = "1", 
+                          'TNF' = "0")) %>%
+  # Compute inclusion year
+  mutate(start_year = start_date) %>%
+  mutate(start_year = year(start_year))
+
+
+
+count(randomization, condition)
+
+```
+
+## Patient selection
+Remove patients that were inadvertently included (stop_reason = 5)
+
+```{r}
+randomization <- subset(randomization, stop_reason != 5 | is.na(stop_reason))
+randomization$condition <- droplevels(randomization$condition)
+
+count(randomization, condition) # One patient in each condition removed
+```
+
+
+## List number of patients by group that discontinued with the study plus stopreason
+
+```{r}
+randomization <- randomization %>% 
+  mutate(
+    # Compute difference in weeks between start and stop dates
+    diff_stop_study_weeks = as.numeric(difftime(stop_date, start_date, units = "weeks"))
+    ) %>%
+  # Create a new variable for stopped within 48 weeks (zero in all other cases)
+  mutate(stopped_study = ifelse(diff_stop_study_weeks < 48, 1, 0))
+
+  # Summarize the number and reasons of dropout per condition
+  # Filter data for 'stopped' equals 1
+  filtered_data <- randomization %>% 
+    dplyr::filter(stopped_study == 1)
+
+# Summarize 'stop_reason' by 'condition'
+  summary <- filtered_data %>% 
+    group_by(condition, stop_reason) %>% 
+    summarise(count = n(), .groups = "drop")
+  summary
+
+# Stop_reason 1 = Deceased
+# Stop_reason 2 = Moved
+# Stop_reason 3 = Comorbidity
+# Stop_reason 4 = Patient's own decision
+# Stop_reason 5 = Inadvertently included
+# Stop_reason 6 = Medication-free remission
+# Stop_reason 7 = Study completed
+# Stop_reason 999 = Unknown/NA
+```
+
+
+## Merge `patients` and `randomization` dataframes into `sample` dataframe:
+
+```{r}
+sample <- patients %>% 
+  # right_join to only keep correctly included patients in the sample
+  right_join(randomization, by = "patient_id") %>%
+  # Compute age
+  rename(age = birthyear) %>% 
+  mutate(age = (start_year - age))  
+
+count(sample, condition)
+```
+
+
+
+# Merging baseline sociodemographic and clinical characteristics
+## Sociodemographics
+
+```{r}
+sociodemo <- read_delim(list.files("data/", full.names = TRUE, 
+                                   pattern = "questionnaire_sociodemo")[[1]], 
+                        ";", escape_double = F, 
+                        col_types = cols(
+                        id = col_integer(),
+                        cohabitation_setting = col_character(),
+                        highest_education = col_character(),
+                        current_living_situation_1 = col_character(),
+                        current_living_situation_2 = col_character(),
+                        current_living_situation_3 = col_character(),
+                        current_living_situation_4 = col_character(),
+                        current_living_situation_5 = col_character(),
+                        current_living_situation_6 = col_character(),
+                        current_living_situation_7 = col_character(),
+                        current_living_situation_8 = col_character(),
+                        current_living_situation_9 = col_character(),
+                        smoking = col_character(),
+                        smoking_amount = col_integer(),
+                        smoking_period = col_integer(),
+                        alcohol = col_character(),
+                        alcohol_amount_week = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset and removing double entries
+
+```{r}
+sociodemo <- sociodemo %>%
+  # Rename date to match dataframe
+  rename(date_sociodemo = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_sociodemo, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, date_sociodemo) %>% 
+  # For now, select last entry for duplicate entries
+  group_by(patient_id) %>% 
+  filter(row_number() == n()) %>% 
+  # Recode smoking
+  mutate(smoking = dplyr::recode(smoking, 
+                          '1' = "No (never)", 
+                          '2' = "No (stopped)", 
+                          '3' = "Yes")) %>%
+  # Recode alcohol
+  mutate(alcohol = dplyr::recode(alcohol, 
+                          '1' = "No", 
+                          '2' = "Yes")) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+         -changed_by_user_id, -changed_on) 
+
+```
+
+
+Merge `sociodemo` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(sociodemo, by = "patient_id") 
+
+sum(is.na(sample$date_sociodemo)) 
+# Number of patients with missing sociodemographic data 
+```
+
+
+## Disease duration
+
+```{r}
+
+start_ra <- read_delim(list.files("data/", full.names = TRUE, 
+                                  pattern = "questionnaire_start_ra")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(
+                        id = col_integer(),
+                        patient_id = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S")
+                        ))
+```
+
+
+Cleaning dataset and removing double entries
+
+```{r}
+start_ra <- start_ra %>%
+  # Rename date to match with dataframe
+  rename(date_start_ra = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_start_ra, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, desc(entered_on)) %>% 
+  # Select last entry for duplicate entries (addition after monitoring)
+  group_by(patient_id) %>% 
+  mutate(rn = row_number()) %>% 
+  arrange(patient_id, rn) %>% 
+  filter(row_number() == n() | rn == 1) %>% 
+  filter(rn <= 1) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+         -changed_by_user_id, -changed_on, -rn) 
+```
+
+
+Merge `start_ra` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(start_ra, by = "patient_id") %>%
+  # Compute disease duration
+  rename(disease_duration_years = rheumatism_since_year) %>% 
+  mutate(disease_duration_years = (start_year - disease_duration_years)) 
+
+sum(is.na(sample$date_start_ra)) 
+# Number of patients with missings 
+```
+
+
+## BMI
+
+```{r}
+bmi <- read_delim(list.files("data/", full.names = TRUE, 
+                             pattern = "patient_bmi")[[1]],
+                  ";", escape_double = F, col_types = cols(
+                        id = col_integer(),
+                        length = col_integer(),
+                        weight = col_integer(),
+                        bmi = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+
+```
+
+
+Cleaning dataset and removing double entries
+
+```{r}
+bmi <- bmi %>%
+  # Rename date to match with dataframe
+  rename(date_bmi = date) %>%  
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_bmi, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, desc(entered_on)) %>% 
+  # For now, select first entry for duplicate entries
+  group_by(patient_id) %>% 
+  mutate(rn = row_number()) %>% 
+  arrange(patient_id, rn) %>% 
+  filter(row_number() == n() | rn == 1) %>% 
+  filter(rn <= 1) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+         -changed_by_user_id, -changed_on, -rn)
+```
+
+
+Merge `bmi` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(bmi, by = "patient_id")
+
+sum(is.na(sample$date_bmi)) 
+# Number of patients with missings 
+```
+
+
+## Erosions
+
+```{r}
+rontgen <- read_delim(list.files("data/", full.names = TRUE, 
+                                 pattern =  "questionnaire_rontgen")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(
+                        id = col_integer(),
+                        measurement = col_character(),
+                        erosions = col_character(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset and removing double entries
+
+```{r}
+rontgen <- rontgen %>%
+  # Rename date to match with dataframe
+  rename(date_rontgen = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_rontgen, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, desc(entered_on)) %>% 
+  # Select last entry for duplicate entries (addition after monitoring)
+  group_by(patient_id) %>% 
+  mutate(rn = row_number()) %>% 
+  arrange(patient_id, rn) %>% 
+  filter(row_number() == n() | rn == 1) %>% 
+  filter(rn <= 1) %>% 
+  # Recode erosions
+  mutate(erosions = dplyr::recode(erosions, 
+                          '1' = "Yes", 
+                          '2' = "No", 
+                          '3' = "Unknown")) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-id, -measurement, -duration, -entered_by_user_id, -entered_on, 
+         -changed_by_user_id, -changed_on, -rn) %>% 
+  # Recode erosions
+  mutate(erosions = dplyr::recode(erosions, 
+                          '2' = "0", 
+                          '3' = "3")) # 0 = No, 1 = Yes, 3 = Unknown
+
+```
+
+
+Merge `rontgen` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(rontgen, by = "patient_id")
+
+sum(is.na(sample$date_rontgen)) 
+# Number of patients with missings 
+```
+
+
+## Rheumatoid Factor (RF)
+
+```{r}
+rheumatismfactor <- read_delim(list.files("data/", full.names = TRUE, 
+                      pattern = "questionnaire_rheumatismfactor")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(
+                        id = col_integer(),
+                        reumafactor = col_character(),
+                        reumafactor_amount = col_integer(),
+                        reumafactor_date = col_datetime("%Y-%m-%d"),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset and removing double entries
+
+```{r}
+rheumatismfactor <- rheumatismfactor %>%
+  # Rename date to match with dataframe
+  rename(rf = reumafactor, rf_amount = reumafactor_amount, 
+         rf_date = reumafactor_date, date_rheumatismfactor = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_rheumatismfactor, everything()) %>%
+  
+  # For duplicate entries, once RF positive -> always RF positive!
+  # Sort by patient_id and rf
+  group_by(patient_id, rf) %>% 
+  mutate(rn = row_number()) %>% 
+  arrange(patient_id, rn) %>% 
+  filter(row_number() == n() | rn == 1) %>% 
+  filter(rn <= 1) %>% 
+  dplyr::select(-rn) %>% 
+  
+  # Sort by patient_id and date
+  arrange(patient_id, rf) %>%
+  
+  # Select last entry for remaining duplicate entries (addition after monitoring)
+  group_by(patient_id) %>% 
+  mutate(rn = row_number()) %>% 
+  arrange(patient_id, rn) %>% 
+  filter(row_number() == n() | rn == 1) %>% 
+  filter(rn <= 1) %>%
+  
+  # Recode rheumatismfactor
+  mutate(rf = dplyr::recode(rf, 
+                            '1' = "Positive",  
+                            '2' = "Negative", 
+                            '3' = "Unknown")) %>% 
+  
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+                -changed_by_user_id, -changed_on)
+  
+```
+
+
+Merge `rheumatismfactor` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(rheumatismfactor, by = "patient_id")
+
+sum(is.na(sample$date_rheumatismfactor)) 
+# Number of patients with missings 
+```
+
+
+## Anti-CCP
+
+```{r}
+anticcp <- read_delim(list.files("data/", full.names = TRUE, 
+                                 pattern = "questionnaire_anticcp")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(
+                        id = col_integer(),
+                        anticcp = col_character(),
+                        anticcp_date = col_datetime("%Y-%m-%d"),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset and removing double entries
+
+```{r}
+anticcp <- anticcp %>%
+  # Rename date to match with dataframe
+  rename(date_anticcp = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_anticcp, everything()) %>%
+  # Recode rheumatismfactor
+  mutate(anticcp = dplyr::recode(anticcp, 
+                          '2' = "Negative", 
+                          '1' = "Positive")) %>% 
+  
+  # For duplicate entries, once ACPA positive -> always ACPA positive!
+  # Sort by patient_id and anticcp
+  arrange(patient_id, anticcp) %>% 
+  group_by(patient_id) %>% 
+  filter(row_number() == n()) %>% 
+  
+  # For remaining duplicate entries (shouldn't be possible) -> keep most recent
+  # Sort by patient_id and rf
+  arrange(patient_id, date_anticcp) %>% 
+  group_by(patient_id) %>% 
+  filter(row_number() == n()) %>%
+    
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+                -changed_by_user_id, -changed_on)
+  
+```
+
+
+Merge `anticcp` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(anticcp, by = "patient_id")
+
+sum(is.na(sample$date_anticcp)) 
+# Number of patients with missings 
+```
+
+
+## Comorbidities
+
+```{r}
+comorbidity <- read_delim(list.files("data/", full.names = TRUE, 
+                                     pattern = "questionnaire_perfect_comorbidity")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(
+                        id = col_integer(),
+                        patient_id = col_integer(),
+                        cardiovasculaire_ziekte = col_character(),
+                        maligniteiten = col_character(),
+                        infecties = col_character(),
+                        gastro_intestinale_ziekte = col_character(),
+                        osteoporose = col_character(),
+                        depressie = col_character(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset and removing double entries
+
+```{r}
+comorbidity <- comorbidity %>%
+  # Rename date to match with dataframe
+  rename(date_comorbidity = date, 
+         cardiovascular_disease = cardiovasculaire_ziekte,
+         malignancy = maligniteiten, 
+         infections = infecties, 
+         gastro_intestinal_disease = gastro_intestinale_ziekte, 
+         osteoporosis = osteoporose, 
+         depression = depressie) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_comorbidity, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, desc(entered_on)) %>% 
+  # select last entry for duplicate entries (addition after monitoring)
+  group_by(patient_id) %>% 
+  mutate(rn = row_number()) %>% 
+  arrange(patient_id, rn) %>% 
+  filter(row_number() == n() | rn == 1) %>% 
+  filter(rn <= 1) %>%  
+  # Recode comorbidity scores
+  mutate_at(vars(cardiovascular_disease:depression), ~recode(., 
+                                      '1' = "Yes", 
+                                      '0' = "No")) %>%
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+                -changed_by_user_id, -changed_on, -rn)
+  
+```
+
+
+Merge `comorbidity` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(comorbidity, by = "patient_id")
+
+sum(is.na(sample$date_comorbidity)) 
+# Number of patients with missings 
+```
+
+
+## Patient medication 
+
+```{r}
+patient_medication <- read_delim(list.files("data/", full.names = TRUE, 
+                              pattern = "patient_medication")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(.default = "c",
+                        id = col_integer(),
+                        stopreason_id = col_integer(),
+                        medicine_id = col_integer(),
+                        route_id = col_integer(),
+                        frequency_id = col_integer(),
+                        unit_id = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"), 
+                        othermedicine = col_guess(),
+                        dose = col_character(),
+                        start_date = col_datetime("%Y-%m-%d"),
+                        stop_date = col_datetime("%Y-%m-%d"),
+                        stop_text = col_guess(),
+                        patient_id = col_integer(),
+                        brand = col_guess(),
+                        combination_dose = col_character(),
+                        indication_id = col_character(),
+                        indication_other = col_guess()
+                        ))
+problems(patient_medication)
+```
+
+
+
+Compute concomitant MTX use at start bDMARD (example)
+
+```{r}
+mtx <- patient_medication %>%
+  # Moving patient_id to first column
+  dplyr::select(patient_id, everything()) %>%
+  # Remove unnecessary columns
+  dplyr::select(-id, -stopreason_id, -route_id, -frequency_id, -unit_id, 
+                -entered_by_user_id, -entered_on, -changed_by_user_id, 
+                -changed_on, -othermedicine, -dose, -stop_text, -brand, 
+                -combination_dose, -indication_id, -indication_other) %>% 
+  # Select rows for MTX only
+  filter(medicine_id == "7") %>% 
+  # Select only those rows with a valid (non-missing) start_date
+  filter(!is.na(start_date)) %>% 
+  # Sort by patient_id and start_date
+  arrange(patient_id, start_date, stop_date) %>% 
+  
+  # Rename item names
+  rename(mtx_start_date = start_date,
+         mtx_stop_date = stop_date)  
+
+```
+
+
+
+Join `mtx` with `start_date`: 
+
+```{r}
+mtx <- mtx %>% 
+  left_join(sample, by = "patient_id") %>%
+  mutate(
+    # Compute difference in weeks from study (bDMARD) start_date at once for 
+    # both start and stop dates
+    diff_start_weeks = as.numeric(difftime(mtx_start_date, start_date, 
+                                           units = "weeks")),
+    diff_stop_weeks = as.numeric(difftime(mtx_stop_date, start_date, 
+                                          units = "weeks"))) %>%
+    # Filter based on diff_in_weeks for both start and stop dates
+  filter((diff_start_weeks <= 0 | is.na(diff_start_weeks)) & 
+         (diff_stop_weeks > 0 | is.na(diff_stop_weeks))) %>%
+  # Group by patient_id and select the last entry for duplicate entries
+  group_by(patient_id) %>% 
+  arrange(desc(mtx_stop_date), desc(mtx_start_date)) %>%
+  slice(1) %>%
+  # Rename column
+  mutate(concomitant_mtx = as.character(row_number())) %>%
+  # Select only the necessary columns
+  dplyr::select(patient_id, concomitant_mtx)
+```
+
+
+Merge `mtx` with `sample` dataframe:
+
+```{r}
+sample <- sample %>% 
+  # left_join to keep all patients in the sample
+  left_join(mtx, by = "patient_id")
+  
+  sum(is.na(sample$concomitant_mtx))
+  # Number of patients with missings (no MTX use) 
+
+
+
+sample <- sample %>% 
+  # Recode NA's into 0
+  mutate(concomitant_mtx = coalesce(concomitant_mtx, "0")) %>% 
+  mutate(concomitant_mtx = dplyr::recode(concomitant_mtx, 
+                          '1' = "Yes", 
+                          '0' = "No")) %>% 
+  mutate(erosions = factor(erosions), rf = factor(rf), anticcp = factor(anticcp), 
+         smoking = factor(smoking), concomitant_mtx = factor(concomitant_mtx))
+
+```
+
+
+Compute new condition for combi vs mono therapy (Bari+MTX, Bari mono, TNFi+MTX, TNFi mono) as factor vraiable
+
+```{r}
+sample <- sample %>%
+  mutate(condition_combi_mono = factor(case_when(
+    condition == 0 & concomitant_mtx == "Yes" ~ 2,
+    condition == 0 & concomitant_mtx == "No" ~ 3,
+    condition == 1 & concomitant_mtx == "Yes" ~ 0,
+    condition == 1 & concomitant_mtx == "No" ~ 1,
+    TRUE ~ NA_integer_
+  ), levels = c(0, 1, 2, 3), labels = c("0", "1", "2", "3")))
+
+
+```
+
+
+
+
+# Preparing longitudinal disease activity measurements
+## DAS28
+
+```{r}
+das28 <- read_delim(list.files("data/", full.names = TRUE, 
+                               pattern = "questionnaire_das28")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(.default = "c",
+                        id = col_integer(),
+                        tjc28 = col_number(),
+                        sjc28 = col_number(),
+                        score = col_number(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset
+
+```{r}
+das28 <- das28 %>%
+  # Rename date to match dataframe
+  rename(date_das28 = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_das28, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, date_das28) %>%
+    # Remove unnecessary columns
+  dplyr::select(-id, -rai_tmp_right:-sji_mtpt_left, -duration, -entered_by_user_id, 
+         -entered_on, -changed_by_user_id, -changed_on) 
+  
+das28 <- das28 %>%  
+  # Compute summed joint counts
+  rowwise() %>%
+  mutate(jc28 = sum(c_across(tjc28:sjc28), na.rm = T)) %>%
+  mutate(delta_tsjc28 = tjc28 - sjc28) %>%
+  ungroup() %>%
+  # Move jc28 column after sjc28
+  dplyr::select(patient_id, date_das28, tjc28, sjc28, jc28, everything())
+  
+```
+
+
+Join `das28` with `start_date`:
+
+```{r}
+das28 <- das28 %>% 
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_das28, tjc28, sjc28, jc28, delta_tsjc28, score, 
+                start_date)
+
+
+
+# Compute number of weeks from start_date
+das28$diff_in_weeks <- as.numeric(difftime(das28$date_das28, das28$start_date, 
+                                    units = c("weeks")))
+das28$diff_abs_in_weeks <- abs(as.numeric(difftime(das28$date_das28,
+                                                   das28$start_date, 
+                                                   units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+das28 <- das28 %>%
+  mutate(week = case_when(diff_in_weeks >= -6 & diff_in_weeks < 6 ~ 0, 
+                          diff_in_weeks >= 6 & diff_in_weeks < 18 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+das28 <- das28 %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_abs_in_weeks,-diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 12, 24, 36, or 48)
+  drop_na(week)
+
+count(das28, week)
+# Number of patients with available measurements at each timepoint
+```
+
+
+## CRP
+
+```{r}
+crp <- read_delim(list.files("data/", full.names = TRUE, 
+                             pattern = "lab_crp")[[1]], 
+                  ";", escape_double = F, col_types = cols(.default = "c",
+                        id = col_integer(),
+                        crp = col_number(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset
+
+```{r}
+crp <- crp %>%
+  # Rename date to match dataframe
+  rename(date_crp = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_crp, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, date_crp) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+         -changed_by_user_id, -changed_on) 
+
+```
+
+
+Identify any possible duplicate cases based on date and keep the last
+entry:
+
+```{r}
+crp[!duplicated(crp$patient_id) | duplicated(crp$date_crp), fromLast = TRUE ]
+# no duplicates
+```
+
+
+## BSE
+
+```{r}
+bse <- read_delim(list.files("data/", full.names = TRUE, 
+                             pattern = "lab_bse")[[1]], ";", escape_double = F, 
+                  col_types = cols(.default = "c", 
+                        id = col_integer(),
+                        bse = col_number(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+```
+
+
+Cleaning dataset
+
+```{r}
+bse <- bse %>%
+  # Rename date to match dataframe
+  rename(date_bse = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_bse, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, date_bse) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+         -changed_by_user_id, -changed_on) 
+
+```
+
+
+Identify any possible duplicate cases based on date and keep the last
+entry:
+
+```{r}
+bse[!duplicated(bse$patient_id) | duplicated(bse$date_bse), fromLast = TRUE ]
+# no duplicates
+```
+
+
+Join CRP and BSE on date (range):
+
+```{r}
+# Add a 7 days date range for BSE
+bse <- bse %>% 
+  mutate(bse, date_minus = as.Date(date_bse) - 7) %>% 
+  mutate(bse, date_plus = as.Date(date_bse) + 7)
+
+# Merge (left_join) BSE with CRP using fuzzy_join if 
+# BSE is measured within 1 week range of CRP 
+crp_bse <- fuzzy_left_join(crp, bse, by = c(
+    "patient_id" = "patient_id",
+    "date_crp" = "date_minus",
+    "date_crp" = "date_plus"),
+  match_fun = list(`==`, `>=`, `<=`)) %>%
+  dplyr::select(patient_id = patient_id.x, date_crp, crp, date_bse, bse)
+
+# Find duplicates resulting from multiple BSE values within the specified range
+crp_bse$diff_in_days<- abs(as.numeric(difftime(crp_bse$date_crp, 
+                                               crp_bse$date_bse, 
+                                               units = c("days")))) 
+# Sort by patient_id and date
+crp_bse <- crp_bse %>% 
+  arrange(patient_id, date_crp, desc(diff_in_days)) %>% 
+  group_by(patient_id, date_crp) %>%
+  filter(row_number() == n()) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_in_days) 
+  
+```
+
+
+Join `crp_bse` with `start_date`:
+
+```{r}
+crp_bse <- crp_bse %>% 
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_crp, crp, date_bse, bse, start_date)
+
+
+
+# Compute number of weeks from start_date
+crp_bse$diff_in_weeks <- as.numeric(difftime(crp_bse$date_crp, 
+                                             crp_bse$start_date, 
+                                             units = c("weeks")))
+crp_bse$diff_abs_in_weeks <- abs(as.numeric(difftime(crp_bse$date_crp, 
+                                                     crp_bse$start_date, 
+                                                     units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+crp_bse <- crp_bse %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks <= 6 ~ 0, 
+                          diff_in_weeks >= 6 & diff_in_weeks <= 18 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks <= 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks <= 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks <= 60 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+crp_bse <- crp_bse %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_abs_in_weeks,-diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 12, 24, 36, or 48)
+  drop_na(week)
+
+count(crp_bse, week)
+# Number of patients with available measurements at each timepoint
+```
+
+
+## Physician global assessment
+
+```{r}
+physician_global <- read_delim(list.files("data/", full.names = TRUE, 
+                                          pattern = "roma_patient_diseaseactivity")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(.default = "c",
+                        id = col_integer(),
+                        pain = col_integer(),
+                        wellbeing = col_number(),
+                        fatigue = col_integer(),
+                        stiffness = col_integer(),
+                        diseaseactivity = col_integer(),
+                        diseaseactivity_3months = col_integer(),
+                        diseaseactivity_today = col_integer(),
+                        assessor = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+
+colSums(!is.na(physician_global))
+
+```
+
+
+Cleaning dataset
+
+```{r}
+physician_global <- physician_global %>%
+  # Rename date to match dataframe
+  rename(date_physician_global = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_physician_global, everything()) %>%
+  # Sort by patient_id and date
+  arrange(patient_id, date_physician_global) %>% 
+  # Remove unnecessary columns
+  dplyr::select(-id, -pain:-diseaseactivity_today, -duration, -entered_by_user_id, 
+         -entered_on, -changed_by_user_id, -changed_on) %>% 
+  # Rename assessor into physician_global
+  rename(physician_global = assessor) 
+
+```
+
+
+Join `physician_global` with `start_date`:
+
+```{r}
+physician_global <- physician_global %>% 
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_physician_global, physician_global, start_date)
+
+
+
+# Compute number of weeks from start_date
+physician_global$diff_in_weeks <- as.numeric(
+  difftime(physician_global$date_physician_global, 
+           physician_global$start_date, units = c("weeks")))
+
+physician_global$diff_abs_in_weeks <- abs(as.numeric(
+    difftime(physician_global$date_physician_global, 
+             physician_global$start_date, 
+             units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+physician_global <- physician_global %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks <= 6 ~ 0,
+                          diff_in_weeks >= 6 & diff_in_weeks <= 18 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks <= 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks <= 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks <= 60 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+physician_global <- physician_global %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(physician_global) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(physician_global, week)
+# Number of patients with available measurements at each timepoint
+```
+
+# Preparing longitudinal patient-reported outcomes measurements
+## Patient global assessments
+
+```{r}
+patient_globals <- read_delim(list.files("data/", full.names = TRUE, 
+                                         pattern = "roma_patient_diseaseactivity")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(.default = "c",
+                        id = col_integer(),
+                        pain = col_integer(),
+                        wellbeing = col_number(),
+                        fatigue = col_integer(),
+                        stiffness = col_integer(),
+                        diseaseactivity = col_integer(),
+                        diseaseactivity_3months = col_integer(),
+                        diseaseactivity_today = col_integer(),
+                        assessor = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        patient_id = col_integer()
+                        ))
+
+```
+
+
+Cleaning dataset
+
+```{r}
+patient_globals <- patient_globals %>%
+  # Rename date to match dataframe
+  rename(date_patient_globals = date) %>% 
+  # moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_patient_globals, everything()) %>%
+  # Remove unnecessary columns
+  dplyr::select(-id, -stiffness, -diseaseactivity_3months, 
+                -diseaseactivity_today, -assessor, -duration, 
+                -entered_by_user_id, -entered_on, -changed_by_user_id, 
+                -changed_on) %>% 
+  # Sort by patient_id and date
+  arrange(patient_id, date_patient_globals)
+
+colSums(!is.na(patient_globals))
+
+```
+
+
+## VAS Wellbeing
+
+Join `wellbeing` with `start_date`:
+
+```{r}
+wellbeing <- patient_globals %>% 
+  # Select wellbeing only
+  dplyr::select(-pain, -fatigue, -diseaseactivity) %>% 
+  # Rename date to match dataframe
+  rename(date_wellbeing = date_patient_globals) %>%   
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_wellbeing, wellbeing, start_date)
+
+
+
+# Compute number of weeks from start_date
+wellbeing$diff_in_weeks <- as.numeric(difftime(wellbeing$date_wellbeing, 
+                                                      wellbeing$start_date, 
+                                                      units = c("weeks")))
+wellbeing$diff_abs_in_weeks <- abs(as.numeric(difftime(wellbeing$date_wellbeing,
+                                                   wellbeing$start_date, 
+                                                   units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+wellbeing <- wellbeing %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks < 2 ~ 0,
+                          diff_in_weeks >= 2 & diff_in_weeks < 6 ~ 4,
+                          diff_in_weeks >= 6 & diff_in_weeks < 10 ~ 8,
+                          diff_in_weeks >= 10 & diff_in_weeks < 14 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+wellbeing <- wellbeing %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(wellbeing) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 4, 8, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(wellbeing, week)
+# Number of patients with available measurements at each timepoint
+```
+
+
+## VAS Disease activity
+
+Join diseaseactivity with start_date:
+
+```{r}
+diseaseactivity <- patient_globals %>% 
+  # Select diseaseactivity only
+  dplyr::select(-pain, -wellbeing, -fatigue) %>% 
+  # Rename date to match dataframe
+  rename(date_diseaseactivity = date_patient_globals) %>%   
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_diseaseactivity, diseaseactivity, start_date)
+
+
+
+# Compute number of weeks from start_date
+diseaseactivity$diff_in_weeks <- as.numeric(difftime
+                                          (diseaseactivity$date_diseaseactivity, 
+                                          diseaseactivity$start_date, 
+                                          units = c("weeks")))
+diseaseactivity$diff_abs_in_weeks <- abs(as.numeric(difftime
+                                          (diseaseactivity$date_diseaseactivity,
+                                          diseaseactivity$start_date,
+                                          units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+diseaseactivity <- diseaseactivity %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks < 2 ~ 0,
+                          diff_in_weeks >= 2 & diff_in_weeks < 6 ~ 4,
+                          diff_in_weeks >= 6 & diff_in_weeks < 10 ~ 8,
+                          diff_in_weeks >= 10 & diff_in_weeks < 14 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+diseaseactivity <- diseaseactivity %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(diseaseactivity) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 4, 8, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(diseaseactivity, week)
+# Number of patients with available measurements at each timepoint
+```
+
+
+## VAS Pain
+
+Join `pain` with `start_date`:
+
+```{r}
+pain <- patient_globals %>% 
+  # Select diseaseactivity only
+  dplyr::select(-wellbeing, -fatigue, -diseaseactivity) %>% 
+  # Rename date to match dataframe
+  rename(date_pain = date_patient_globals) %>%   
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_pain, pain, start_date)
+
+
+
+# Compute number of weeks from start_date
+pain$diff_in_weeks <- as.numeric(difftime(pain$date_pain, pain$start_date,
+                                          units = c("weeks")))
+pain$diff_abs_in_weeks <- abs(as.numeric(difftime(pain$date_pain, 
+                                                  pain$start_date, 
+                                                  units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+pain <- pain %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks < 2 ~ 0,
+                          diff_in_weeks >= 2 & diff_in_weeks < 6 ~ 4,
+                          diff_in_weeks >= 6 & diff_in_weeks < 10 ~ 8,
+                          diff_in_weeks >= 10 & diff_in_weeks < 14 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+pain <- pain %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(pain) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 4, 8, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(pain, week)
+# Number of patients with available measurements at each timepoint
+```
+
+
+## VAS Fatigue
+
+Join `fatigue` with `start_date`: 
+
+```{r}
+fatigue <- patient_globals %>% 
+  # Select diseaseactivity only
+  dplyr::select(-pain, -wellbeing, -diseaseactivity) %>% 
+  # Rename date to match dataframe
+  rename(date_fatigue = date_patient_globals) %>%   
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_fatigue, fatigue, start_date)
+
+
+
+# Compute number of weeks from start_date
+fatigue$diff_in_weeks <- as.numeric(difftime(fatigue$date_fatigue,
+                                             fatigue$start_date,
+                                             units = c("weeks")))
+fatigue$diff_abs_in_weeks <- abs(as.numeric(difftime(fatigue$date_fatigue,
+                                                     fatigue$start_date,
+                                                     units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+fatigue <- fatigue %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks < 2 ~ 0,
+                          diff_in_weeks >= 2 & diff_in_weeks < 6 ~ 4,
+                          diff_in_weeks >= 6 & diff_in_weeks < 10 ~ 8,
+                          diff_in_weeks >= 10 & diff_in_weeks < 14 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+fatigue <- fatigue %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(fatigue) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 4, 8, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(fatigue, week)
+# Number of patients with available measurements at each timepoint
+```
+
+## Health Assessment Questionnaire (RAPID-3/HAQ2)
+
+```{r}
+rapid3_haq <- read_delim(list.files("data/", full.names = TRUE, 
+                                    pattern = "questionnaire_rapid3_haq2")[[1]], 
+                         ";", escape_double = F, 
+                         col_types = cols(.default = "c", 
+                        id = col_integer(),
+                        patient_id = col_integer(),
+                        stand_up_from_chair = col_integer(),
+                        walk_on_plain_terrain = col_integer(),
+                        toilet = col_integer(),
+                        grab_above_head = col_integer(),
+                        open_car_door = col_integer(),
+                        work_in_garden = col_integer(),
+                        wait_in_queue = col_integer(),
+                        move_heavy_objects = col_integer(),
+                        lift_heavy_objects = col_integer(),
+                        stair_steps = col_integer(),
+                        walk3km = col_integer(),
+                        sport = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S")
+                        ))
+
+```
+
+
+Cleaning dataset
+
+```{r}
+rapid3_haq <- rapid3_haq %>%
+  # Rename date to match dataframe
+  rename(date_rapid3_haq = date) %>% 
+  # Moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_rapid3_haq, everything()) %>%
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+                -changed_by_user_id, -changed_on) %>% 
+  # Sort by patient_id and date
+  arrange(patient_id, date_rapid3_haq) %>% 
+  # Rename item names
+  rename(haq1 = stand_up_from_chair,
+         haq2 = walk_on_plain_terrain,
+         haq3 = toilet,
+         haq4 = grab_above_head,
+         haq5 = open_car_door,
+         haq6 = work_in_garden,
+         haq7 = wait_in_queue,
+         haq8 = move_heavy_objects,
+         haq9 = lift_heavy_objects,
+         haq10 = stair_steps,
+         haq11 = walk3km,
+         haq12 = sport,
+         ) %>% 
+  # Recode RAPID3 item scores
+  mutate_at(vars(haq1:haq12), ~recode(., 
+                                      '1' = 0, 
+                                      '2' = 1, 
+                                      '3' = 2, 
+                                      '4' = 3)) %>%
+  # Compute raw total score based on the first 10 HAQ2 items (0 - 30)
+  rowwise() %>%
+  mutate(rapid3_haq = sum(c_across(haq1:haq10), na.rm = T)) %>% 
+  ungroup() %>% 
+  # Remove individual items
+  dplyr::select(-haq1:-haq12)
+
+```
+
+
+Join `rapid3_haq` with `start_date`:
+
+```{r}
+rapid3_haq <- rapid3_haq %>% 
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_rapid3_haq, rapid3_haq, start_date)
+
+
+
+# Compute number of weeks from start_date
+rapid3_haq$diff_in_weeks <- as.numeric(difftime(rapid3_haq$date_rapid3_haq, 
+                                                   rapid3_haq$start_date, 
+                                                   units = c("weeks")))
+rapid3_haq$diff_abs_in_weeks <- abs(
+  as.numeric(difftime(rapid3_haq$date_rapid3_haq, 
+                      rapid3_haq$start_date, 
+                      units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+rapid3_haq <- rapid3_haq %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks < 2 ~ 0,
+                          diff_in_weeks >= 2 & diff_in_weeks < 6 ~ 4,
+                          diff_in_weeks >= 6 & diff_in_weeks < 10 ~ 8,
+                          diff_in_weeks >= 10 & diff_in_weeks < 14 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+rapid3_haq <- rapid3_haq %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(rapid3_haq) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 4, 8, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(rapid3_haq, week)
+# Number of patients with available measurements at each timepoint
+```
+
+
+## Generalized Pain Questionnaire (GPQ)
+
+```{r}
+gpq <- read_delim(list.files("data/", full.names = TRUE, 
+                             pattern = "questionnaire_gpq")[[1]], 
+                  ";", escape_double = F, 
+                  col_types = cols(.default = "c", 
+                        id = col_integer(),
+                        patient_id = col_integer(),
+                        pijn_aanraking = col_integer(),
+                        pijn_wrijving = col_integer(),
+                        pijn_warmte = col_integer(),
+                        pijn_langer = col_integer(),
+                        pijn_later = col_integer(),
+                        pijn_intens = col_integer(),
+                        pijn_verspreid = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S")
+                        ))
+
+```
+
+
+Cleaning dataset
+
+```{r}
+gpq <- gpq %>%
+  # Rename date to match dataframe
+  rename(date_gpq = date) %>% 
+  # Moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_gpq, everything()) %>%
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+                -changed_by_user_id, -changed_on) %>% 
+  # Sort by patient_id and date
+  arrange(patient_id, date_gpq) %>% 
+  # Rename item names
+  rename(gpq1 = pijn_aanraking,
+         gpq2 = pijn_wrijving,
+         gpq3 = pijn_warmte,
+         gpq4 = pijn_langer,
+         gpq5 = pijn_later,
+         gpq6 = pijn_intens,
+         gpq7 = pijn_verspreid,
+         ) %>% 
+  # Recode GPQ item scores
+  mutate_at(vars(gpq1:gpq7), ~recode(., 
+                                      '1' = 0, 
+                                      '2' = 1, 
+                                      '3' = 2, 
+                                      '4' = 3,
+                                      '5' = 4)) %>%
+  # Compute raw total score (0 - 28)
+  rowwise() %>%
+  mutate(gpq = sum(c_across(gpq1:gpq7), na.rm = T)) %>% 
+  ungroup() %>% 
+  # Compute GQP positive cutoff
+  mutate(gpq, gpq_positive = ifelse(gpq > 10, "1", "0"))  
+  
+```
+
+
+
+Join `gpq` with `start_date`:
+
+```{r}
+gpq <- gpq %>% 
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_gpq, gpq1:gpq7, gpq, gpq_positive, start_date)
+
+
+
+# Compute number of weeks from start_date
+gpq$diff_in_weeks <- as.numeric(difftime(gpq$date_gpq, 
+                                         gpq$start_date, units = c("weeks")))
+gpq$diff_abs_in_weeks <- abs(as.numeric(difftime(gpq$date_gpq, gpq$start_date, 
+                                                 units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+gpq <- gpq %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks < 2 ~ 0,
+                          diff_in_weeks >= 2 & diff_in_weeks < 6 ~ 4,
+                          diff_in_weeks >= 6 & diff_in_weeks < 10 ~ 8,
+                          diff_in_weeks >= 10 & diff_in_weeks < 14 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+gpq <- gpq %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(gpq) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 4, 8, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(gpq, week)
+# Number of patients with available measurements at each timepoint
+```
+
+# Calculate internal consistency values for the GPQ separately for each week
+
+```{r}
+cronbach_results <- gpq %>%
+  group_by(week) %>%
+  summarise(alpha = alpha(across(gpq1:gpq7))$total$raw_alpha)
+
+# Print the results
+cronbach_results
+
+# Remove GPQ items
+gpq <- gpq %>%
+  dplyr::select(-gpq1:-gpq7) 
+  
+```
+
+
+
+## Health status 
+EQ-5D-5L
+
+```{r}
+eq5d5l <- read_delim(list.files("data/", full.names = TRUE, 
+                                pattern = "questionnaire_euroqol5d5l")[[1]], 
+                       ";", escape_double = F,
+                       col_types = cols(.default = "c",
+                        id = col_integer(),
+                        patient_id = col_integer(),
+                        mobiliteit = col_integer(),
+                        zelfzorg = col_integer(),
+                        dagelijkse_activiteiten = col_integer(),
+                        pijn_ongemak = col_integer(),
+                        angst_depressie = col_integer(),
+                        date = col_datetime("%Y-%m-%d"),
+                        duration = col_integer(),
+                        entered_by_user_id = col_character(),
+                        entered_on = col_datetime("%Y-%m-%d %H:%M:%S"),
+                        changed_by_user_id = col_character(),
+                        changed_on = col_datetime("%Y-%m-%d %H:%M:%S")
+                        ))
+
+```
+
+
+Cleaning dataset
+
+```{r}
+eq5d5l <- eq5d5l %>%
+  # Rename date to match dataframe
+  rename(date_eq5d5l = date) %>% 
+  # Moving patient_id and date to first two columns
+  dplyr::select(patient_id, date_eq5d5l, everything()) %>%
+  # Remove unnecessary columns
+  dplyr::select(-id, -duration, -entered_by_user_id, -entered_on, 
+                -changed_by_user_id, -changed_on) %>% 
+  # Sort by patient_id and date
+  arrange(patient_id, date_eq5d5l) %>% 
+  # Rename item names
+  rename(mo = mobiliteit,
+         sc = zelfzorg,
+         ua = dagelijkse_activiteiten,
+         pd = pijn_ongemak,
+         ad = angst_depressie
+         ) %>% 
+
+  # Recode EQ-5D-5L item scores
+  mutate_at(vars(mo:ad), ~recode(., 
+                                 '0' = 1, 
+                                 '1' = 2, 
+                                 '2' = 3, 
+                                 '3' = 4, 
+                                 '4' = 5))
+
+# Compute tariff score based on Versteegh et al (Value in Health 2016)
+# Preferred tobit model (Model 3: tobit with constraints)
+# Checked with SPSS syntax (perfect agreement)
+
+eq5d5l <- eq5d5l %>%
+  rowwise() %>%
+  mutate(eq5d5l = 1) %>%
+  mutate(eq5d5l = case_when(mo + sc + ua + pd + ad > 5 ~ eq5d5l-0.0469233,
+                            TRUE ~ eq5d5l)) %>%
+  mutate(eq5d5l = case_when(mo == 2 ~ eq5d5l-0.0354544, 
+                            mo == 3 ~ eq5d5l-0.0565962, 
+                            mo == 4 ~ eq5d5l-0.166003, 
+                            mo == 5 ~ eq5d5l-0.2032975, 
+                            TRUE ~ eq5d5l)) %>%
+  mutate(eq5d5l = case_when(sc == 2 ~ eq5d5l-0.0381079, 
+                            sc == 3 ~ eq5d5l-0.0605347, 
+                            sc == 4 ~ eq5d5l-0.1677852, 
+                            sc == 5 ~ eq5d5l-0.1677852, 
+                            TRUE ~ eq5d5l)) %>%
+  mutate(eq5d5l = case_when(ua == 2 ~ eq5d5l-0.0391539,
+                            ua == 3 ~ eq5d5l-0.0867559,
+                            ua == 4 ~ eq5d5l-0.1924631,
+                            ua == 5 ~ eq5d5l-0.1924631,
+                            TRUE ~ eq5d5l)) %>%
+  mutate(eq5d5l = case_when(pd == 2 ~ eq5d5l-0.0658959,
+                            pd == 3 ~ eq5d5l-0.0919619,
+                            pd == 4 ~ eq5d5l-0.35993,
+                            pd == 5 ~ eq5d5l-0.4152142,
+                            TRUE ~ eq5d5l)) %>%
+  mutate(eq5d5l = case_when(ad == 2 ~ eq5d5l-0.069622,
+                            ad == 3 ~ eq5d5l-0.1445222,
+                            ad == 4 ~ eq5d5l-0.3563913,
+                            ad == 5 ~ eq5d5l-0.4206361, 
+                            TRUE ~ eq5d5l)) 
+```
+
+
+Join `eq5d5l` with `start_date`:
+
+```{r}
+eq5d5l <- eq5d5l %>% 
+  # left_join to keep all patients in the sample
+  left_join(sample, by = "patient_id") %>% 
+  # Remove unnecessary columns
+  dplyr::select(patient_id, date_eq5d5l, eq5d5l, start_date)
+
+
+
+# Compute number of weeks from start_date
+eq5d5l$diff_in_weeks <- as.numeric(difftime(eq5d5l$date_eq5d5l, 
+                                            eq5d5l$start_date, 
+                                            units = c("weeks")))
+eq5d5l$diff_abs_in_weeks <- abs(as.numeric(difftime(eq5d5l$date_eq5d5l, 
+                                                    eq5d5l$start_date, 
+                                                    units = c("weeks"))))
+
+# Recode difference in weeks in to weeks based on ranges 
+# (full data optimalization)
+eq5d5l <- eq5d5l %>%
+  mutate(week = case_when(diff_in_weeks >= -4 & diff_in_weeks < 2 ~ 0,
+                          diff_in_weeks >= 2 & diff_in_weeks < 6 ~ 4,
+                          diff_in_weeks >= 6 & diff_in_weeks < 10 ~ 8,
+                          diff_in_weeks >= 10 & diff_in_weeks < 14 ~ 12,
+                          diff_in_weeks >= 18 & diff_in_weeks < 32 ~ 24,
+                          diff_in_weeks >= 32 & diff_in_weeks < 44 ~ 36,
+                          diff_in_weeks >= 44 & diff_in_weeks < 54 ~ 48, 
+                          TRUE ~ NA_real_))
+
+# Sort by patient_id and difference in weeks
+eq5d5l <- eq5d5l %>%
+  # Remove cases (rows) witn NAs for physician global
+  drop_na(eq5d5l) %>% 
+  mutate(diff_weeks = abs(week - diff_abs_in_weeks)) %>% 
+  arrange(patient_id, week, desc(diff_weeks)) %>% 
+  group_by(patient_id, week) %>%
+  filter(row_number() == n()) %>%
+  ungroup() %>% 
+  # Remove unnecessary columns
+  dplyr::select(-diff_abs_in_weeks, -diff_weeks) %>%
+  # Remove cases (rows) outside valid measurement point 
+  # (week 0, 4, 8, 12, 24, 36, or 48)
+  drop_na(week)  
+
+count(eq5d5l, week)
+# Number of patients with available measurements at each timepoint
+```
+
+
+
+
+## Merging disease activity components and PROMS
+Join on time point (week):
+
+```{r}
+# Merge (full_join) the different components, 
+# starting with the dataframe with most entries (das28)
+
+merged_outcomes <- full_join(das28, crp_bse, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date.x, -diff_in_weeks.x, -start_date.y, -diff_in_weeks.y)
+
+merged_outcomes <- full_join(merged_outcomes, physician_global, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+merged_outcomes <- full_join(merged_outcomes, wellbeing, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+merged_outcomes <- full_join(merged_outcomes, pain, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+merged_outcomes <- full_join(merged_outcomes, fatigue, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+merged_outcomes <- full_join(merged_outcomes, gpq, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+merged_outcomes <- full_join(merged_outcomes, rapid3_haq, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+merged_outcomes <- full_join(merged_outcomes, eq5d5l, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+
+merged_outcomes <- merged_outcomes %>% 
+  arrange(patient_id, week) %>% 
+  # moving patient_id to first column
+  dplyr::select(patient_id, week, everything())
+
+count(merged_outcomes, week)
+# Number of patients with available measurements at each timepoint
+
+miss_var_summary(merged_outcomes)
+# Explore missing data
+```
+
+
+## Compute DAS28 scores
+
+```{r}
+# If wellbeing or crp are missing (but not joint counts) impute with simpuation by means of robust linear regression through M-estimation, using the patient’s values for the remaining components of the DAS28
+set.seed(2022001)
+merged_outcomes <- merged_outcomes %>%
+  impute_rlm(wellbeing ~ sjc28 + tjc28 + crp, add_residual="observed") %>% 
+  impute_rlm(wellbeing ~ sjc28 + tjc28, add_residual="observed") %>% 
+  impute_rlm(crp ~ sjc28 + tjc28 + wellbeing, add_residual="observed") %>% 
+  impute_rlm(crp ~ sjc28 + tjc28, add_residual="observed") %>% 
+  # Round imputed values and set min and max limits
+  mutate_if(is.numeric, round) %>% 
+  mutate(wellbeing = ifelse(wellbeing < 0, 0, wellbeing)) %>% 
+  mutate(wellbeing = ifelse(wellbeing > 100, 100, wellbeing)) %>% 
+  mutate(crp = ifelse(crp < 1, 0, crp)) %>% 
+  mutate(crp = ifelse(crp > 99, 100, crp))
+
+
+# Compute disease activity indices
+merged_outcomes <- merged_outcomes %>%
+  mutate(DAS28_CRP = 0.56*sqrt(tjc28) + 0.28*sqrt(sjc28) + 0.36*log(crp + 1) 
+         + 0.014*wellbeing + 0.96) %>% 
+  mutate(DAS28_ESR = 0.56*sqrt(tjc28) + 0.28*sqrt(sjc28) + 0.70*log(bse) 
+         + 0.014*wellbeing)
+
+```
+
+
+
+
+## Merging `merged_outcomes` dataframe with `sample` dataframe
+
+```{r}
+sample_merged_outcomes <- full_join(sample, merged_outcomes, by = c(
+    "patient_id" = "patient_id")) %>% 
+  
+  # Include rows for missing observations !!!
+  complete(nesting(!!!dplyr::select(.,patient_id:concomitant_mtx)), 
+           week = (c(0,4,8,12,24,36,48)))
+
+```
+
+
+
+# Baseline analysis
+
+```{r}
+# Select only baseline rows
+baseline_merged_outcomes <- sample_merged_outcomes %>%
+  filter(week == "0") %>% 
+  mutate(condition = dplyr::recode(condition, 
+                          "1" = "Baricitinib", 
+                          "0" = "TNFi")) 
+ 
+
+comparison_table <- compareGroups(condition ~ age + gender + smoking + 
+                                    bmi + disease_duration_years + erosions + 
+                                    cardiovascular_disease + rf + anticcp + 
+                                    concomitant_mtx + gpq + DAS28_ESR + DAS28_CRP + 
+                                    tjc28 + sjc28 + bse + crp + physician_global + 
+                                    wellbeing + pain + rapid3_haq, 
+                                  data = baseline_merged_outcomes, 
+                                  method = c(tjc28 = 1, sjc28 = 1, 
+                                             disease_duration_years = 2, bse = 2, 
+                                             crp = 2
+                                             ))
+```
+
+
+
+```{r}
+baseline_table <- createTable(comparison_table)
+
+export2md(baseline_table, format = "markdown", strip = TRUE, first.strip = TRUE, 
+          size = 10)
+```
+
+# Differences in GPQ scores across sex, smoking, alcohol, erosions, rf, anticcp and depression on the dependent varaible gpq.
+
+
+```{r}
+# Gender
+# Calculate mean and SD for each level of 'gender'
+summary_stats <- baseline_merged_outcomes %>%
+  group_by(gender) %>%
+  summarise(
+    mean_gpq = mean(gpq, na.rm = TRUE),
+    sd_gpq = sd(gpq, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Perform ANOVA on 'gender' for the dependent variable 'gpq'
+anova_result <- aov(gpq ~ gender, data = baseline_merged_outcomes) %>%
+  tidy()
+
+# Extract the ANOVA row related to 'gender'
+anova_gender <- anova_result %>%
+  filter(term == "gender") %>%
+  select(df, sumsq = sumsq, meansq = meansq, statistic = statistic, p.value = p.value)
+
+# Combine summary statistics with ANOVA results
+combined_results <- summary_stats %>%
+  mutate(df = anova_gender$df,
+         sumsq = anova_gender$sumsq,
+         meansq = anova_gender$meansq,
+         F_value = anova_gender$statistic,
+         p_value = anova_gender$p.value)
+
+# Print the combined results
+print(combined_results)
+
+
+
+# Smoking
+# Calculate mean and SD for each level 
+summary_stats <- baseline_merged_outcomes %>%
+  group_by(smoking) %>%
+  summarise(
+    mean_gpq = mean(gpq, na.rm = TRUE),
+    sd_gpq = sd(gpq, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Perform ANOVA
+anova_result <- aov(gpq ~ smoking, data = baseline_merged_outcomes) %>%
+  tidy()
+
+# Extract the ANOVA row
+anova_smoking <- anova_result %>%
+  filter(term == "smoking") %>%
+  select(df, sumsq = sumsq, meansq = meansq, statistic = statistic, p.value = p.value)
+
+# Combine summary statistics with ANOVA results
+combined_results <- summary_stats %>%
+  mutate(df = anova_smoking$df,
+         sumsq = anova_smoking$sumsq,
+         meansq = anova_gender$meansq,
+         F_value = anova_smoking$statistic,
+         p_value = anova_smoking$p.value)
+
+# Print the combined results
+print(combined_results)
+
+
+
+# Alcohol
+# Calculate mean and SD for each level of 'gender'
+summary_stats <- baseline_merged_outcomes %>%
+  group_by(alcohol) %>%
+  summarise(
+    mean_gpq = mean(gpq, na.rm = TRUE),
+    sd_gpq = sd(gpq, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Perform ANOVA
+anova_result <- aov(gpq ~ alcohol, data = baseline_merged_outcomes) %>%
+  tidy()
+
+# Extract the ANOVA row
+anova_alcohol <- anova_result %>%
+  filter(term == "alcohol") %>%
+  select(df, sumsq = sumsq, meansq = meansq, statistic = statistic, p.value = p.value)
+
+# Combine summary statistics with ANOVA results
+combined_results <- summary_stats %>%
+  mutate(df = anova_alcohol$df,
+         sumsq = anova_alcohol$sumsq,
+         meansq = anova_alcohol$meansq,
+         F_value = anova_alcohol$statistic,
+         p_value = anova_alcohol$p.value)
+
+# Print the combined results
+print(combined_results)
+
+
+
+# Erosions
+# Calculate mean and SD for each level
+summary_stats <- baseline_merged_outcomes %>%
+  group_by(erosions) %>%
+  summarise(
+    mean_gpq = mean(gpq, na.rm = TRUE),
+    sd_gpq = sd(gpq, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Perform ANOVA
+anova_result <- aov(gpq ~ erosions, data = baseline_merged_outcomes) %>%
+  tidy()
+
+# Extract the ANOVA row
+anova_erosions <- anova_result %>%
+  filter(term == "erosions") %>%
+  select(df, sumsq = sumsq, meansq = meansq, statistic = statistic, p.value = p.value)
+
+# Combine summary statistics with ANOVA results
+combined_results <- summary_stats %>%
+  mutate(df = anova_erosions$df,
+         sumsq = anova_erosions$sumsq,
+         meansq = anova_erosions$meansq,
+         F_value = anova_erosions$statistic,
+         p_value = anova_erosions$p.value)
+
+# Print the combined results
+print(combined_results)
+
+
+
+# Rheumatoid factor
+# Calculate mean and SD for each level
+summary_stats <- baseline_merged_outcomes %>%
+  group_by(rf) %>%
+  summarise(
+    mean_gpq = mean(gpq, na.rm = TRUE),
+    sd_gpq = sd(gpq, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Perform ANOVA
+anova_result <- aov(gpq ~ rf, data = baseline_merged_outcomes) %>%
+  tidy()
+
+# Extract the ANOVA row
+anova_rf <- anova_result %>%
+  filter(term == "rf") %>%
+  select(df, sumsq = sumsq, meansq = meansq, statistic = statistic, p.value = p.value)
+
+# Combine summary statistics with ANOVA results
+combined_results <- summary_stats %>%
+  mutate(df = anova_rf$df,
+         sumsq = anova_rf$sumsq,
+         meansq = anova_rf$meansq,
+         F_value = anova_rf$statistic,
+         p_value = anova_rf$p.value)
+
+# Print the combined results
+print(combined_results)
+
+
+
+# ACPA
+# Calculate mean and SD for each level
+summary_stats <- baseline_merged_outcomes %>%
+  group_by(anticcp) %>%
+  summarise(
+    mean_gpq = mean(gpq, na.rm = TRUE),
+    sd_gpq = sd(gpq, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Perform ANOVA
+anova_result <- aov(gpq ~ anticcp, data = baseline_merged_outcomes) %>%
+  tidy()
+
+# Extract the ANOVA row
+anova_anticcp <- anova_result %>%
+  filter(term == "anticcp") %>%
+  select(df, sumsq = sumsq, meansq = meansq, statistic = statistic, p.value = p.value)
+
+# Combine summary statistics with ANOVA results
+combined_results <- summary_stats %>%
+  mutate(df = anova_anticcp$df,
+         sumsq = anova_anticcp$sumsq,
+         meansq = anova_anticcp$meansq,
+         F_value = anova_anticcp$statistic,
+         p_value = anova_anticcp$p.value)
+
+# Print the combined results
+print(combined_results)
+
+
+
+# Depression
+# Calculate mean and SD for each level
+summary_stats <- baseline_merged_outcomes %>%
+  group_by(depression) %>%
+  summarise(
+    mean_gpq = mean(gpq, na.rm = TRUE),
+    sd_gpq = sd(gpq, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Perform ANOVA
+anova_result <- aov(gpq ~ depression, data = baseline_merged_outcomes) %>%
+  tidy()
+
+# Extract the ANOVA row
+anova_depression <- anova_result %>%
+  filter(term == "depression") %>%
+  select(df, sumsq = sumsq, meansq = meansq, statistic = statistic, p.value = p.value)
+
+# Combine summary statistics with ANOVA results
+combined_results <- summary_stats %>%
+  mutate(df = anova_depression$df,
+         sumsq = anova_depression$sumsq,
+         meansq = anova_depression$meansq,
+         F_value = anova_depression$statistic,
+         p_value = anova_depression$p.value)
+
+# Print the combined results
+print(combined_results)
+
+
+```
+
+
+
+
+# Explore correlations with GPQ at baseline
+
+```{r}
+# Filter the dataframe to include only rows where week = 0
+baseline_merged_outcomes <- baseline_merged_outcomes %>%
+  select(gpq, DAS28_CRP, tjc28, sjc28, delta_tsjc28, crp, bse, 
+         physician_global, wellbeing, pain, fatigue, rapid3_haq, eq5d5l, age, 
+         disease_duration_years, bmi)
+
+# Compute the Spearman correlation matrix with confidence intervals and p-values
+corr_results <- psych::corr.test(baseline_merged_outcomes, method = "spearman")
+
+# Extract correlation matrix
+corr_matrix <- corr_results$r
+
+# Extract 95% confidence intervals
+ci_matrix <- corr_results$ci
+
+# Extract p-values
+p_matrix <- corr_results$p
+
+# Combine results into a list for easier handling
+baseline_combined_results <- list(
+  correlations = corr_matrix,
+  ci = ci_matrix,
+  p_values = p_matrix
+)
+
+# Print the results
+print(baseline_combined_results)
+
+```
+
+
+
+# Explore correlations with GPQ at 12 weeks
+
+```{r}
+# Select only 12-week rows
+week12_merged_outcomes <- sample_merged_outcomes %>%
+  filter(week == "12") %>% 
+  mutate(condition = dplyr::recode(condition, 
+                          "1" = "Baricitinib", 
+                          "0" = "TNFi")) 
+
+# Selct relevantr variables
+week12_merged_outcomes <- week12_merged_outcomes %>%
+  select(gpq, DAS28_CRP, tjc28, sjc28, delta_tsjc28, crp, bse, 
+         physician_global, wellbeing, pain, fatigue, rapid3_haq, eq5d5l, age, 
+         disease_duration_years, bmi)
+
+# Compute the Spearman correlation matrix with confidence intervals and p-values
+corr_results <- psych::corr.test(week12_merged_outcomes, method = "spearman")
+
+# Extract correlation matrix
+corr_matrix <- corr_results$r
+
+# Extract 95% confidence intervals
+ci_matrix <- corr_results$ci
+
+# Extract p-values
+p_matrix <- corr_results$p
+
+# Combine results into a list for easier handling
+week12_combined_results <- list(
+  correlations = corr_matrix,
+  ci = ci_matrix,
+  p_values = p_matrix
+)
+
+# Print the results
+print(week12_combined_results)
+
+```
+
+
+# Explore correlations with GPQ at 24 weeks
+
+```{r}
+# Select only 24-week rows
+week24_merged_outcomes <- sample_merged_outcomes %>%
+  filter(week == "24") %>% 
+  mutate(condition = dplyr::recode(condition, 
+                          "1" = "Baricitinib", 
+                          "0" = "TNFi")) 
+
+# Selct relevantr variables
+week24_merged_outcomes <- week24_merged_outcomes %>%
+  select(gpq, DAS28_CRP, tjc28, sjc28, delta_tsjc28, crp, bse, 
+         physician_global, wellbeing, pain, fatigue, rapid3_haq, eq5d5l, age, 
+         disease_duration_years, bmi)
+
+# Compute the Spearman correlation matrix with confidence intervals and p-values
+corr_results <- psych::corr.test(week24_merged_outcomes, method = "spearman")
+
+# Extract correlation matrix
+corr_matrix <- corr_results$r
+
+# Extract 95% confidence intervals
+ci_matrix <- corr_results$ci
+
+# Extract p-values
+p_matrix <- corr_results$p
+
+# Combine results into a list for easier handling
+week24_combined_results <- list(
+  correlations = corr_matrix,
+  ci = ci_matrix,
+  p_values = p_matrix
+)
+
+# Print the results
+print(week24_combined_results)
+
+```
+
+
+# Explore correlations with GPQ at 36 weeks
+
+```{r}
+# Select only 36-week rows
+week36_merged_outcomes <- sample_merged_outcomes %>%
+  filter(week == "36") %>% 
+  mutate(condition = dplyr::recode(condition, 
+                          "1" = "Baricitinib", 
+                          "0" = "TNFi")) 
+
+# Selct relevantr variables
+week36_merged_outcomes <- week36_merged_outcomes %>%
+  select(gpq, DAS28_CRP, tjc28, sjc28, delta_tsjc28, crp, bse, 
+         physician_global, wellbeing, pain, fatigue, rapid3_haq, eq5d5l, age, 
+         disease_duration_years, bmi)
+
+# Compute the Spearman correlation matrix with confidence intervals and p-values
+corr_results <- psych::corr.test(week36_merged_outcomes, method = "spearman")
+
+# Extract correlation matrix
+corr_matrix <- corr_results$r
+
+# Extract 95% confidence intervals
+ci_matrix <- corr_results$ci
+
+# Extract p-values
+p_matrix <- corr_results$p
+
+# Combine results into a list for easier handling
+week36_combined_results <- list(
+  correlations = corr_matrix,
+  ci = ci_matrix,
+  p_values = p_matrix
+)
+
+# Print the results
+print(week36_combined_results)
+
+```
+
+
+# Explore correlations with GPQ at 48 weeks
+
+```{r}
+# Select only 48-week rows
+week48_merged_outcomes <- sample_merged_outcomes %>%
+  filter(week == "48") %>% 
+  mutate(condition = dplyr::recode(condition, 
+                          "1" = "Baricitinib", 
+                          "0" = "TNFi")) 
+
+# Selct relevantr variables
+week48_merged_outcomes <- week48_merged_outcomes %>%
+  select(gpq, DAS28_CRP, tjc28, sjc28, delta_tsjc28, crp, bse, 
+         physician_global, wellbeing, pain, fatigue, rapid3_haq, eq5d5l, age, 
+         disease_duration_years, bmi)
+
+# Compute the Spearman correlation matrix with confidence intervals and p-values
+corr_results <- psych::corr.test(week48_merged_outcomes, method = "spearman")
+
+# Extract correlation matrix
+corr_matrix <- corr_results$r
+
+# Extract 95% confidence intervals
+ci_matrix <- corr_results$ci
+
+# Extract p-values
+p_matrix <- corr_results$p
+
+# Combine results into a list for easier handling
+week48_combined_results <- list(
+  correlations = corr_matrix,
+  ci = ci_matrix,
+  p_values = p_matrix
+)
+
+# Print the results
+print(week48_combined_results)
+
+```
+
+
+
+# ACR criteria computation
+Computing percentage change from baseline (week 0)
+
+```{r}
+sample_merged_outcomes <- sample_merged_outcomes %>%
+  arrange(patient_id, week) %>%
+  group_by(patient_id) %>%
+  # 1L is first value of each respective list element (by patient)
+  mutate(diff_tjc28 = ((tjc28[1L] - tjc28) / tjc28[1L]) * 100) %>%
+  mutate(diff_sjc28 = ((sjc28[1L] - sjc28) / sjc28[1L]) * 100) %>%
+  mutate(diff_crp = ((crp[1L] - crp) / crp[1L]) * 100) %>%
+  mutate(diff_physician_global = ((physician_global[1L] - physician_global) / 
+                                    physician_global[1L]) * 100) %>%
+  mutate(diff_wellbeing = ((wellbeing[1L] - wellbeing) / 
+                             wellbeing[1L]) * 100) %>%
+  mutate(diff_pain = ((pain[1L] - pain) / pain[1L]) * 100) %>%
+  mutate(diff_rapid3_haq = ((rapid3_haq[1L] - rapid3_haq) / 
+                              rapid3_haq[1L]) * 100) %>%
+  # Positive percentage scores (diff_) are improvements for all ACR components
+  # If baseline values are zero (e.g. for sjc28 or tjc28) diff_scores are set
+  # to -Inf or NaN!!
+
+  ungroup
+```
+
+
+
+
+# ACR criteria non-inferiority analysis for 12 weeks 
+## Compute meeting ACR50 citeria
+
+```{r}
+sample_merged_outcomes <- sample_merged_outcomes %>%
+  # Are SJC28 and TJC28 at least 50% improved?
+  mutate(tjcsjc_ACR50 = rowSums(dplyr::select(sample_merged_outcomes, 
+                                     `diff_tjc28`:`diff_sjc28`) >= 50, 
+                                na.rm = TRUE)) %>%
+  
+  # How many of the other 5 ACR50 components are at least 50% improved?
+  mutate(n_of_ACR50 = rowSums(dplyr::select(sample_merged_outcomes, 
+                                     `diff_crp`:`diff_rapid3_haq`) >= 50, 
+                              na.rm = TRUE)) %>%
+  
+  # Compute ACR50 improvement criterion
+  mutate(ACR50_achieved = ifelse(tjcsjc_ACR50 >= 2 & 
+                                   n_of_ACR50 >= 3, "1", "0")) %>%
+  
+  # Are both SJC28 and TJC28 available? 
+  mutate(tjcsjc_ACR50_valid = ifelse(rowSums(is.na(dplyr::select(sample_merged_outcomes, 
+                                     `diff_tjc28`:`diff_sjc28`))) < 1, 
+                                     "1", "0")) %>%
+  
+  # Are at least 3 of the 5 other components available? 
+  mutate(n_of_ACR50_valid = ifelse(rowSums(is.na(dplyr::select(sample_merged_outcomes,
+                                   `diff_crp`:`diff_rapid3_haq`))) <= 2, 
+                                   "1", "0"))
+  
+
+# Recode ACR50_achieved to NA when either tjcsjc_ACR50_valid or n_of_ACR50_valid are 0
+sample_merged_outcomes$ACR50_achieved <- ifelse(sample_merged_outcomes$tjcsjc_ACR50_valid == 0, 99, 
+                                      sample_merged_outcomes$ACR50_achieved)
+  
+sample_merged_outcomes$ACR50_achieved <- ifelse(sample_merged_outcomes$n_of_ACR50_valid == 0, 99, 
+                                      sample_merged_outcomes$ACR50_achieved)
+
+# Recode ACR50_achieved values of 99 to NA 
+sample_merged_outcomes <- sample_merged_outcomes %>%
+  replace_with_na(replace = list(ACR50_achieved = 99))
+
+```
+
+
+
+```{r}
+# Select only baseline rows
+sample_ACR50_BL <- sample_merged_outcomes %>%
+  filter(week == "0") 
+
+bl <- data.frame(sample_ACR50_BL$patient_id,sample_ACR50_BL$tjc28,
+                 sample_ACR50_BL$sjc28,sample_ACR50_BL$crp,
+                 sample_ACR50_BL$physician_global,sample_ACR50_BL$wellbeing,
+                 sample_ACR50_BL$pain,sample_ACR50_BL$rapid3_haq)
+colnames(bl) <- c("Patient_ID","tjc28","sjc28","crp","physician_global",
+                  "wellbeing","pain", "rapid_haq")
+
+# Select only 12 weeks rows
+sample_ACR50_12weeks <- sample_merged_outcomes %>%
+  filter(week == "12") 
+
+a12 <- data.frame(sample_ACR50_12weeks$patient_id,sample_ACR50_12weeks$tjc28,
+                  sample_ACR50_12weeks$sjc28,sample_ACR50_12weeks$crp,
+                  sample_ACR50_12weeks$physician_global,
+                  sample_ACR50_12weeks$wellbeing,sample_ACR50_12weeks$pain,
+                  sample_ACR50_12weeks$rapid3_haq)
+colnames(a12) <- c("Patient_ID","tjc28","sjc28","crp","physician_global",
+                   "wellbeing","pain", "rapid_haq")
+
+me <-merge(bl, a12, by.x="Patient_ID", by.y = "Patient_ID")
+
+me$n_complete = ifelse(rowSums(is.na(dplyr::select(me,
+                                   `tjc28.x`:`rapid_haq.y`))) == 0, 
+                                   "1", "0")
+CC_ID <-data.frame (me$Patient_ID,me$n_complete)
+
+```
+
+
+
+```{r}
+sample_ACR50_12weeks <- sample_ACR50_12weeks %>%
+# Recode condition
+  mutate(condition = dplyr::recode(condition, 
+                          '1' = "Bari", 
+                          '0' = "TNF")) %>%
+  mutate(ACR50_achieved = dplyr::recode(ACR50_achieved, 
+                          '1' = "Achieved", 
+                          '0' = "Not achieved"))%>%
+
+#Are all ACR components available at baseline and 12 weeks?
+mutate(n_complete_cases_ACR50.12 = ifelse(rowSums(is.na(dplyr::select(
+  sample_ACR50_12weeks, `diff_tjc28`:`diff_rapid3_haq`))) == 0, 
+  "1", "0")) 
+
+```
+
+
+
+
+
+## Proportions with ACR50 response at 12 week (complete cases)
+```{r}
+
+CC_ACR50.12 <-merge(x=sample_ACR50_12weeks,y=CC_ID,by.x="patient_id",by.y ="me.Patient_ID")
+
+X_CC<-CC_ACR50.12  %>%  
+   filter(me.n_complete == "1") %>%
+group_by(condition, ACR50_achieved) %>%
+   summarise (n = n()) %>% mutate(pct = (n / sum(n))*100)
+N.CC.ACR50.TNFi <- as.numeric(colSums(X_CC[1:3,3]))
+N.CC.ACR50.Bari <- as.numeric(colSums(X_CC[4:6,3]))
+a <- as.numeric(X_CC[4,3])
+b <- as.numeric(X_CC[1,3]) 
+c <- N.CC.ACR50.Bari -a
+d <- N.CC.ACR50.TNFi - b
+PP <- binomDiffCI(a,b,c,d,conf.level = 0.95, paired = FALSE, 
+                  method = "wilson", alternative = c("two.sided"))
+PP2 <- unlist(PP)
+PP3 <- data.frame(PP2)
+PP
+
+```
+
+
+
+# DAS28-CRP remission analysis for 12 weeks in PP and as observed population
+## Compute meeting DAS28-CRP remission criterion
+
+```{r}
+sample_ACR50_12weeks <- sample_ACR50_12weeks %>% 
+# Compute variable for achieving DAS28-CRP remission
+  mutate(DAS28_CRP_remission = ifelse(DAS28_CRP < 2.6, "1", "0")) %>%
+  mutate(DAS28_CRP_remission = dplyr::recode(DAS28_CRP_remission, 
+                          '1' = "Achieved", 
+                          '0' = "Not achieved"))
+```
+
+
+## Compare proportions with 12 weeks DAS28_CRP remission (complete case analysis)
+
+```{r}
+options(digits = 2)
+DAS_CRP_rem_PP <- sample_ACR50_12weeks %>%  
+  group_by(condition, DAS28_CRP_remission) %>%
+  summarise (n = n()) %>% 
+  mutate(pct = (n / sum(n))*100) 
+DAS_CRP_rem_PP <-data.frame(DAS_CRP_rem_PP)
+a2 <- as.numeric(DAS_CRP_rem_PP[4,3])
+b2 <-as.numeric(DAS_CRP_rem_PP[1,3])
+c2 <- as.numeric(DAS_CRP_rem_PP[5,3])
+d2 <-as.numeric(DAS_CRP_rem_PP[2,3])
+N.CC.DAS28.12.Bari <- a2+c2
+N.CC.DAS28.12.TNFi <-b2+d2
+das_CRP_rem_test_PP <-binomDiffCI(a2,b2,c2,d2,conf.level = 0.95, paired = FALSE,
+                 method = "wilson", alternative = c("two.sided"))
+das_CRP_rem_test_PP <-unlist(das_CRP_rem_test_PP)
+das_CRP_rem_test_PP <-as.data.frame(das_CRP_rem_test_PP)
+```
+
+
+# Predictive ability of baseline GPQ scores for 12-week remission
+## ROC analysis
+
+```{r}
+gpq_bl <- gpq %>%
+  filter(week == "0")
+
+
+das28_remission <- sample_merged_outcomes %>%
+  select(patient_id, week, DAS28_CRP) %>% 
+  # Compute variable for achieving DAS28-CRP remission
+  mutate(DAS28_CRP_remission = ifelse(DAS28_CRP < 2.6, "1", "0")) %>%
+  mutate(DAS28_CRP_remission = dplyr::recode(DAS28_CRP_remission, 
+                          '1' = "Achieved", 
+                          '0' = "Not achieved"))
+
+das28_remission <- left_join(das28_remission, select(gpq_bl, patient_id, gpq), by = "patient_id") %>% 
+    mutate(remission = ifelse(DAS28_CRP_remission == "Not achieved", 1, 0))
+
+
+
+das28_remission_week12 <- das28_remission %>% 
+  filter(week == "12") 
+das28_remission_week24 <- das28_remission %>% 
+  filter(week == "24") 
+das28_remission_week36 <- das28_remission %>% 
+  filter(week == "36") 
+das28_remission_week48 <- das28_remission %>% 
+  filter(week == "48") 
+
+  
+```
+
+
+
+ROC 12 weeks
+
+```{r}
+# Generate ROC curve and calculate confidence intervals
+pROC_obj <- roc(das28_remission_week12$remission, das28_remission_week12$gpq,
+                smoothed = TRUE,
+                # Arguments for confidence intervals
+                ci = TRUE, ci.alpha = 0.90, stratified = FALSE,
+                # Arguments for plot
+                plot = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, grid = TRUE,
+                print.auc = TRUE, show.thres = TRUE)
+
+pROC_obj[["auc"]]
+pROC_obj[["ci"]]
+
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(pROC_obj)
+
+# Plot the ROC curve with corrected axis limits
+par(pty = "s") ## "s" - creates a square plotting region
+plot(pROC_obj, xlim = c(1, 0), ylim = c(0, 1), 
+     col = "blue", lwd = 2, 
+     # main = "ROC curve with 95% confidence intervals", 
+     legacy.axes = TRUE, 
+     print.auc = FALSE,  
+     )
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+
+## Finding out the optimal threshold  
+## Store the relevant data used to make the ROC graph in a list
+roc.info <- roc(das28_remission_week12$remission, das28_remission_week12$gpq, legacy.axes=TRUE)
+str(roc.info)
+## and then extract just the information that we want from that variable.
+# Create a dataframe with all thresholds and their corresponding metrics
+roc.df <- data.frame(
+  thresholds = roc.info$thresholds,
+  sensitivities = roc.info$sensitivities,
+  specificities = roc.info$specificities,
+  youden_index = roc.info$sensitivities + roc.info$specificities - 1
+)
+
+
+```
+
+Save ROC curve plot as TIFF file.
+
+```{r}
+# Generate ROC curve without plotting and without automatic text annotations
+roc_info <- roc(response = das28_remission_week12$remission, predictor = das28_remission_week12$gpq,
+                smoothed = TRUE, ci = TRUE, ci.alpha = 0.9, stratified = FALSE,
+                plot = FALSE)
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(roc_info)
+
+# Open TIFF device
+tiff("ROC_Curve_Remission_12weeks.tiff", width = 2400, height = 2400, res = 300, 
+     compression = "lzw")
+
+# Initialize the plotting area with reversed x-axis limits and larger fonts
+plot(roc_info, col = "blue", lwd = 2, 
+     xlab = "1 - Specificity", ylab = "Sensitivity", 
+     xlim = c(1, 0), ylim = c(0, 1), legacy.axes = TRUE,
+     cex.lab = 1.8,  # Increase axis labels size
+     cex.axis = 1.5,  # Increase axis tick labels size
+     cex.main = 1,  # Increase main title size
+     main = "")
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+# Add AUC text with increased font size
+text(0.6, 0.2, paste("AUC =", round(roc_info$auc, 2)), col = "black", cex = 1.5)
+
+# Add large capital A in the upper left corner
+text(x = 0.95, y = 0.95, labels = "A", cex = 3, col = "black", font = 2)
+
+# Close the TIFF device
+dev.off()
+
+```
+
+
+ROC 24 weeks
+
+```{r}
+# Generate ROC curve and calculate confidence intervals
+pROC_obj <- roc(das28_remission_week24$remission, das28_remission_week24$gpq,
+                smoothed = TRUE,
+                # Arguments for confidence intervals
+                ci = TRUE, ci.alpha = 0.90, stratified = FALSE,
+                # Arguments for plot
+                plot = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, grid = TRUE,
+                print.auc = TRUE, show.thres = TRUE)
+
+pROC_obj[["auc"]]
+pROC_obj[["ci"]]
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(pROC_obj)
+
+# Plot the ROC curve with corrected axis limits
+par(pty = "s") ## "s" - creates a square plotting region
+plot(pROC_obj, xlim = c(1, 0), ylim = c(0, 1), 
+     col = "blue", lwd = 2, 
+     # main = "ROC curve with 95% confidence intervals", 
+     legacy.axes = TRUE, 
+     print.auc = FALSE,  
+     )
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+
+## Finding out the optimal threshold  
+## Store the relevant data used to make the ROC graph in a list
+roc.info <- roc(das28_remission_week24$remission, das28_remission_week24$gpq, legacy.axes=TRUE)
+str(roc.info)
+## and then extract just the information that we want from that variable.
+# Create a dataframe with all thresholds and their corresponding metrics
+roc.df <- data.frame(
+  thresholds = roc.info$thresholds,
+  sensitivities = roc.info$sensitivities,
+  specificities = roc.info$specificities,
+  youden_index = roc.info$sensitivities + roc.info$specificities - 1
+)
+
+
+```
+
+
+Save ROC curve plot as TIFF file.
+
+```{r}
+# Generate ROC curve without plotting and without automatic text annotations
+roc_info <- roc(response = das28_remission_week24$remission, predictor = das28_remission_week24$gpq,
+                smoothed = TRUE, ci = TRUE, ci.alpha = 0.9, stratified = FALSE,
+                plot = FALSE)
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(roc_info)
+
+# Open TIFF device
+tiff("ROC_Curve_Remission_24weeks.tiff", width = 2400, height = 2400, res = 300, 
+     compression = "lzw")
+
+# Initialize the plotting area with reversed x-axis limits and larger fonts
+plot(roc_info, col = "blue", lwd = 2, 
+     xlab = "1 - Specificity", ylab = "Sensitivity", 
+     xlim = c(1, 0), ylim = c(0, 1), legacy.axes = TRUE,
+     cex.lab = 1.8,  # Increase axis labels size
+     cex.axis = 1.5,  # Increase axis tick labels size
+     cex.main = 1,  # Increase main title size
+     main = "")
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+# Add AUC text with increased font size
+text(0.6, 0.2, paste("AUC =", round(roc_info$auc, 2)), col = "black", cex = 1.5)
+
+# Add large capital B in the upper left corner
+text(x = 0.95, y = 0.95, labels = "B", cex = 3, col = "black", font = 2)
+
+# Close the TIFF device
+dev.off()
+
+```
+
+
+
+
+ROC 36 weeks
+
+```{r}
+# Generate ROC curve and calculate confidence intervals
+pROC_obj <- roc(das28_remission_week36$remission, das28_remission_week36$gpq,
+                smoothed = TRUE,
+                # Arguments for confidence intervals
+                ci = TRUE, ci.alpha = 0.90, stratified = FALSE,
+                # Arguments for plot
+                plot = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, grid = TRUE,
+                print.auc = TRUE, show.thres = TRUE)
+
+pROC_obj[["auc"]]
+pROC_obj[["ci"]]
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(pROC_obj)
+
+# Plot the ROC curve with corrected axis limits
+par(pty = "s") ## "s" - creates a square plotting region
+plot(pROC_obj, xlim = c(1, 0), ylim = c(0, 1), 
+     col = "blue", lwd = 2, 
+     # main = "ROC curve with 95% confidence intervals", 
+     legacy.axes = TRUE, 
+     print.auc = FALSE,  
+     )
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+
+## Finding out the optimal threshold  
+## Store the relevant data used to make the ROC graph in a list
+roc.info <- roc(das28_remission_week36$remission, das28_remission_week36$gpq, legacy.axes=TRUE)
+str(roc.info)
+## and then extract just the information that we want from that variable.
+# Create a dataframe with all thresholds and their corresponding metrics
+roc.df <- data.frame(
+  thresholds = roc.info$thresholds,
+  sensitivities = roc.info$sensitivities,
+  specificities = roc.info$specificities,
+  youden_index = roc.info$sensitivities + roc.info$specificities - 1
+)
+
+
+```
+
+
+Save ROC curve plot as TIFF file.
+
+```{r}
+# Generate ROC curve without plotting and without automatic text annotations
+roc_info <- roc(response = das28_remission_week36$remission, predictor = das28_remission_week36$gpq,
+                smoothed = TRUE, ci = TRUE, ci.alpha = 0.9, stratified = FALSE,
+                plot = FALSE)
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(roc_info)
+
+# Open TIFF device
+tiff("ROC_Curve_Remission_36weeks.tiff", width = 2400, height = 2400, res = 300, 
+     compression = "lzw")
+
+# Initialize the plotting area with reversed x-axis limits and larger fonts
+plot(roc_info, col = "blue", lwd = 2, 
+     xlab = "1 - Specificity", ylab = "Sensitivity", 
+     xlim = c(1, 0), ylim = c(0, 1), legacy.axes = TRUE,
+     cex.lab = 1.8,  # Increase axis labels size
+     cex.axis = 1.5,  # Increase axis tick labels size
+     cex.main = 1,  # Increase main title size
+     main = "")
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+# Add AUC text with increased font size
+text(0.6, 0.2, paste("AUC =", round(roc_info$auc, 2)), col = "black", cex = 1.5)
+
+# Add large capital C in the upper left corner
+text(x = 0.95, y = 0.95, labels = "C", cex = 3, col = "black", font = 2)
+
+# Close the TIFF device
+dev.off()
+
+```
+
+
+
+ROC 48 weeks
+
+```{r}
+# Generate ROC curve and calculate confidence intervals
+pROC_obj <- roc(das28_remission_week48$remission, das28_remission_week48$gpq,
+                smoothed = TRUE,
+                # Arguments for confidence intervals
+                ci = TRUE, ci.alpha = 0.90, stratified = FALSE,
+                # Arguments for plot
+                plot = TRUE, auc.polygon = TRUE, max.auc.polygon = TRUE, grid = TRUE,
+                print.auc = TRUE, show.thres = TRUE)
+
+pROC_obj[["auc"]]
+pROC_obj[["ci"]]
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(pROC_obj)
+
+# Plot the ROC curve with corrected axis limits
+par(pty = "s") ## "s" - creates a square plotting region
+plot(pROC_obj, xlim = c(1, 0), ylim = c(0, 1), 
+     col = "blue", lwd = 2, 
+     # main = "ROC curve with 95% confidence intervals", 
+     legacy.axes = TRUE, 
+     print.auc = FALSE,  
+     )
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+
+## Finding out the optimal threshold  
+## Store the relevant data used to make the ROC graph in a list
+roc.info <- roc(das28_remission_week48$remission, das28_remission_week48$gpq, legacy.axes=TRUE)
+str(roc.info)
+## and then extract just the information that we want from that variable.
+# Create a dataframe with all thresholds and their corresponding metrics
+roc.df <- data.frame(
+  thresholds = roc.info$thresholds,
+  sensitivities = roc.info$sensitivities,
+  specificities = roc.info$specificities,
+  youden_index = roc.info$sensitivities + roc.info$specificities - 1
+)
+
+
+# Find the threshold with the maximum Youden Index
+max_youden <- roc.df[which.max(roc.df$youden_index), ]
+
+# Print the GPQ score with the highest Youden Index, and its sensitivity and specificity
+cat("Optimal GPQ Score (Threshold):", max_youden$thresholds, "\n",
+    "Sensitivity at Optimal Threshold:", max_youden$sensitivities, "\n",
+    "Specificity at Optimal Threshold:", max_youden$specificities, "\n",
+    "Maximum Youden Index:", max_youden$youden_index, "\n")
+
+```
+
+
+
+Save ROC curve plot as TIFF file.
+
+```{r}
+# Generate ROC curve without plotting and without automatic text annotations
+roc_info <- roc(response = das28_remission_week48$remission, predictor = das28_remission_week48$gpq,
+                smoothed = TRUE, ci = TRUE, ci.alpha = 0.9, stratified = FALSE,
+                plot = FALSE)
+
+# Calculate sensitivity confidence intervals
+sens.ci <- ci.se(roc_info)
+
+# Open TIFF device
+tiff("ROC_Curve_Remission_48weeks.tiff", width = 2400, height = 2400, res = 300, 
+     compression = "lzw")
+
+# Initialize the plotting area with reversed x-axis limits and larger fonts
+plot(roc_info, col = "blue", lwd = 2, 
+     xlab = "1 - Specificity", ylab = "Sensitivity", 
+     xlim = c(1, 0), ylim = c(0, 1), legacy.axes = TRUE,
+     cex.lab = 1.8,  # Increase axis labels size
+     cex.axis = 1.5,  # Increase axis tick labels size
+     cex.main = 1,  # Increase main title size
+     main = "")
+
+# Add the confidence intervals as shaded areas
+plot(sens.ci, type = "shape", col = "lightgrey", add = TRUE)
+
+# Add AUC text with increased font size
+text(0.6, 0.2, paste("AUC =", round(roc_info$auc, 2)), col = "black", cex = 1.5)
+
+# Add large capital D in the upper left corner
+text(x = 0.95, y = 0.95, labels = "D", cex = 3, col = "black", font = 2)
+
+# Close the TIFF device
+dev.off()
+
+```
+
+Combining the ROC curve plots
+
+```{r}
+# Save combined plot for ROC curves
+
+plot1 <- image_read("ROC_Curve_Remission_12weeks.tiff")
+plot2 <- image_read("ROC_Curve_Remission_24weeks.tiff")
+plot3 <- image_read("ROC_Curve_Remission_36weeks.tiff")
+plot4 <- image_read("ROC_Curve_Remission_48weeks.tiff")
+
+# Append images in rows first, then append the rows
+row1 <- image_append(c(plot1, plot2))
+row2 <- image_append(c(plot3, plot4))
+ROC_combined_plot <- image_append(c(row1, row2), stack = TRUE)
+
+# Save the image as a TIFF with 300 DPI resolution
+image_write(ROC_combined_plot, "ROC_combined_plot.tiff")
+
+# To display in R viewer
+print(ROC_combined_plot)
+
+```
+
+
+
+
+
+
+
+########################################
+
+
+
+
+
+# Using `sample_ACR50` dataframe for linear mixed effects analyses of disease activity parameters over time
+
+
+## Merging ACR50 and disease activity components
+Join on time point (week):
+
+```{r}
+# Merge (full_join) the different components, 
+# starting with the dataframe with most entries (das28)
+
+ACR50 <- full_join(das28, crp_bse, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date.x, -diff_in_weeks.x, -start_date.y, -diff_in_weeks.y)
+
+ACR50 <- full_join(ACR50, physician_global, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+ACR50 <- full_join(ACR50, wellbeing, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+ACR50 <- full_join(ACR50, pain, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+ACR50 <- full_join(ACR50, rapid3_haq, by = c(
+    "patient_id" = "patient_id",
+    "week" = "week")) %>%
+dplyr::select(-start_date, -diff_in_weeks)
+
+ACR50 <- ACR50 %>% 
+  arrange(patient_id, week) %>% 
+  # moving patient_id to first column
+  dplyr::select(patient_id, week, everything())
+
+count(ACR50, week)
+# Number of patients with available measurements at each timepoint
+
+miss_var_summary(ACR50)
+# Explore missing data
+```
+
+
+## Compute DAS28, SDAI and CDAI scores
+
+```{r}
+# If wellbeing or crp are missing (but not joint counts) impute with simpuation by means of robust linear regression through M-estimation, using the patient’s values for the remaining components of the DAS28
+set.seed(2022001)
+ACR50 <- ACR50 %>%
+  impute_rlm(wellbeing ~ sjc28 + tjc28 + crp, add_residual="observed") %>% 
+  impute_rlm(wellbeing ~ sjc28 + tjc28, add_residual="observed") %>% 
+  impute_rlm(crp ~ sjc28 + tjc28 + wellbeing, add_residual="observed") %>% 
+  impute_rlm(crp ~ sjc28 + tjc28, add_residual="observed") %>% 
+  # Round imputed values and set min and max limits
+  mutate_if(is.numeric, round) %>% 
+  mutate(wellbeing = ifelse(wellbeing < 0, 0, wellbeing)) %>% 
+  mutate(wellbeing = ifelse(wellbeing > 100, 100, wellbeing)) %>% 
+  mutate(crp = ifelse(crp < 1, 0, crp)) %>% 
+  mutate(crp = ifelse(crp > 99, 100, crp))
+
+# Explore missing data
+miss_var_summary(ACR50)
+
+# Compute disease activity indices
+ACR50 <- ACR50 %>%
+  mutate(DAS28_CRP = 0.56*sqrt(tjc28) + 0.28*sqrt(sjc28) + 0.36*log(crp + 1) 
+         + 0.014*wellbeing + 0.96) %>% 
+  mutate(DAS28_ESR = 0.56*sqrt(tjc28) + 0.28*sqrt(sjc28) + 0.70*log(bse) 
+         + 0.014*wellbeing) %>% 
+  mutate(SDAI = sjc28 + tjc28 + (wellbeing / 10) + (physician_global / 10) + 
+           (crp / 10)) %>% ## CRP mg/dl and globals on 0-10 scale 
+  mutate(CDAI = sjc28 + tjc28 + (wellbeing / 10) + (physician_global / 10))
+
+
+
+
+```
+
+
+
+## Merging `ACR50` dataframe with `sample` dataframe
+
+```{r}
+# Merge (full_join) the different components, 
+# starting with the dataframe with most entries (das28)
+
+sample_ACR50 <- full_join(sample, ACR50, by = c(
+    "patient_id" = "patient_id")) %>% 
+  
+  # Include rows for missing observations !!!
+  complete(nesting(!!!dplyr::select(.,patient_id:concomitant_mtx)), 
+           week = (c(0,4,8,12,24,36,48)))
+
+```
+
+
+
+```{r}
+# Select only relevant weeks rows
+sample_ACR50_lmm <- sample_ACR50 %>%
+  filter(week == "0" | week == "12" | week == "24" | week == "36" | week == "48") %>% 
+
+# Include rows for missing observations !!!
+complete(nesting(!!!dplyr::select(.,patient_id:depression)), 
+         week = (c(0,4,8,12,24,36,48)))  
+
+# Add time as factor to the dataframe to obtain EM means:
+sample_ACR50_lmm <- mutate(sample_ACR50_lmm, fweek = factor(week))
+
+```
+
+
+## Unconditional models
+
+Using NLME to be able to test different variance covariance structures.
+
+Run unconditional models with unstructured, compound symmetry and first-order 
+autoregressive (AR1) covariance matrix to test which covariance structure for 
+the repeated measurements provides the best fit to the data of the primary 
+measure DAS28-CRP.
+
+All models with fixed effect for week plus random effects for patient intercepts and slopes over time
+
+### Unstructured (default)
+```{r}
+model_das28crp_uncond_un <- lme(DAS28_CRP ~  1 + week,
+                      data = sample_ACR50_lmm,
+                      random = ~ week | patient_id,
+                      method = "REML",
+                      na.action = na.exclude, 
+                      # Increased number of iterations for convergence
+                      control = lmeControl(msMaxIter = 1000, msMaxEval = 1000, 
+                                           sing.tol=1e-20)
+                      # sing.tol argument to avoid singular convergence error message
+                       )
+summary(model_das28crp_uncond_un)
+icc(model_das28crp_uncond_un, by_group = F)
+```
+
+
+### Compound symmetry
+```{r}
+
+model_das28crp_uncond_cs <- lme(DAS28_CRP ~  1 + week,
+                      data = sample_ACR50_lmm,
+                      random = ~ week | patient_id,
+                      correlation = corCompSymm(form = ~ week | patient_id),
+                      method = "REML",
+                      na.action = na.exclude, 
+                      # Increased number of iterations for convergence if needed
+                      control = lmeControl(msMaxIter = 1000, msMaxEval = 1000, 
+                                           sing.tol=1e-20)
+                      # sing.tol argument to avoid singular convergence error message
+                      )
+summary(model_das28crp_uncond_cs)
+icc(model_das28crp_uncond_cs, by_group = F)
+```
+
+
+### First-order autoregressive (AR1)
+```{r}
+
+model_das28crp_uncond_ar <- lme(DAS28_CRP ~  1 + week,
+                      data = sample_ACR50_lmm,
+                      random = ~ week | patient_id,
+                      correlation = corAR1(form = ~ week | patient_id),
+                      method = "REML",
+                      na.action = na.exclude, 
+                      # Increased number of iterations for convergence if needed
+                      control = lmeControl(msMaxIter = 1000, msMaxEval = 1000, 
+                                           sing.tol=1e-20)
+                      # sing.tol argument to avoid singular convergence error message
+                       )
+summary(model_das28crp_uncond_ar)
+icc(model_das28crp_uncond_ar, by_group = F)
+```
+
+```{r}
+anova(model_das28crp_uncond_ar, model_das28crp_uncond_un, model_das28crp_uncond_cs)
+# Select compound symmetry since the more complex unstructured 
+# variance-covariance matrix does not show a significantly better fit 
+# and fit of AR1 is also only very sightly better.
+# Use compound symmetry for all ACR-50 indices that were measured 5 times.
+```
+
+## DAS28-CRP using compound symmetry
+```{r}
+
+model_das28crp_uncond_cs <- lme(DAS28_CRP ~  1 + week,
+                      data = sample_ACR50_lmm,
+                      random = ~ week | patient_id,
+                      correlation = corCompSymm(form = ~ week | patient_id),
+                      method = "REML",
+                      na.action = na.exclude
+                       )
+summary(model_das28crp_uncond_cs)
+# Significant main effect time
+
+
+```
+
+
+### Now with week as factor to obtain EM means
+
+```{r}
+
+model_das28crp_uncond_cs_fact <- lme(DAS28_CRP ~  1 + fweek,
+                      data = sample_ACR50_lmm,
+                      random = ~ fweek | patient_id,
+                      correlation = corCompSymm(form = ~ fweek | patient_id),
+                      na.action = na.exclude
+                       )
+summary(model_das28crp_uncond_cs_fact)
+
+
+```
+
+### Write EM means per condition and week to dataframe
+
+```{r}
+emmdat_das28crp = as.data.frame(emmeans(model_das28crp_uncond_cs_fact, ~  0 + fweek))
+
+emmdat_das28crp <- mutate(emmdat_das28crp, week = as.numeric(as.character(fweek)))
+
+# Post-hoc pairwise comparisons with Tukey adjustment using emmeans
+emmeans(model_das28crp_uncond_cs_fact, pairwise ~ 1 + fweek, 
+        adjust = "tukey")
+```
+
+
+
+### Plot EM means and 95% confidence intervals per condition over time
+
+```{r}
+das28_plot<- ggplot(emmdat_das28crp, aes(x = week, y = emmean)) +
+  geom_line(size = .8) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), 
+                linetype = 1, width = 2, size = .5,
+                position=position_dodge(.5)) +
+  labs(x = "Week", y = "DAS28-CRP") + 
+  scale_x_continuous(breaks = c(0,12,24,36,48)) + 
+  scale_y_continuous(breaks = c(2,2.5,3,3.5,4,4.5,5)) +
+  theme_classic() + 
+  scale_shape_manual(name="",
+                      labels=c("TNFi","Baricitinib"), 
+                      values = c(19, 17)) +
+  theme(legend.justification=c(0.0,0.0), legend.position=c(0.01,0.01)) + 
+  theme(axis.text = element_text(size = 12, face="bold"),
+        axis.title=element_text(size=12, face="bold", color="black")) +
+  theme(legend.text=element_text(size=10, face="bold")) +
+  guides(size = "none")
+  
+
+ggsave("das28crp.tiff", width = 2187, height = 1351, units = "px", dpi=300)
+das28_plot
+```
+
+
+
+# GPQ analysis (8 timepoints) with mixed models
+Merging `gpq` dataframe with `sample` dataframe
+
+```{r}
+# Merge (full_join) the different components, 
+
+sample_gpq_lmm <- full_join(sample, gpq, by = c(
+    "patient_id" = "patient_id")) %>% 
+
+# Select only relevant weeks row
+filter(week == "0"| week == "4" | week == "8" | week == "12" | week == "24" | 
+         week == "36" | week == "48") %>% 
+
+# Include rows for missing observations !!!
+complete(nesting(!!!dplyr::select(.,patient_id:depression)), 
+         week = (c(0,4,8,12,24,36,48)))  
+
+# Add time as factor to the dataframe to obtain EM means:
+sample_gpq_lmm <- mutate(sample_gpq_lmm, fweek = factor(week))
+
+head(sample_gpq_lmm)
+```
+
+## Generalized pain using compound symmetry
+```{r}
+
+model_gpq_uncond_cs <- lme(gpq ~  1 + week,
+                      data = sample_gpq_lmm,
+                      random = ~ week | patient_id,
+                      correlation = corCompSymm(form = ~ week | patient_id),
+                      method = "REML",
+                      na.action = na.exclude
+                       )
+summary(model_gpq_uncond_cs)
+# Significant main effect for time
+```
+
+### Now with week as factor to obtain EM means
+
+```{r}
+
+model_gpq_uncond_cs_fact <- lme(gpq ~  1 + fweek,
+                      data = sample_gpq_lmm,
+                      random = ~ fweek | patient_id,
+                      correlation = corCompSymm(form = ~ fweek | patient_id),
+                      na.action = na.exclude,
+                      # Increase number of iterations for convergence
+                      control = lmeControl(msMaxIter = 1000, msMaxEval = 1000)
+                       )
+summary(model_gpq_uncond_cs_fact)
+
+```
+
+### Write EM means per condition and week to dataframe
+
+```{r}
+emmdat_gpq = as.data.frame(emmeans(model_gpq_uncond_cs_fact, ~  0 + fweek))
+
+emmdat_gpq <- mutate(emmdat_gpq, week = as.numeric(as.character(fweek)))
+```
+
+### Plot EM means and 95% confidence intervals per condition over time
+
+```{r}
+gpq_plot<- ggplot(emmdat_gpq, aes(x = week, y = emmean)) +
+  geom_line(size = .8) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), 
+                linetype = 1, width = 2, size = .5,
+                position=position_dodge(.5)) +
+  labs(x = "Week", y = "Generalized pain (GPQ)") + 
+  scale_x_continuous(breaks = c(0,4,8,12,24,36,48)) +
+  theme_classic() + 
+  scale_colour_manual(name="",
+                      labels=c("TNFi","Baricitinib"), 
+                      values = c("#00008B", "#DC143C")) +
+  scale_shape_manual(name="",
+                      labels=c("TNFi","Baricitinib"), 
+                      values = c(19, 17)) +
+  theme(legend.justification=c(0.0,0.0), legend.position=c(0.01,0.01)) + 
+  theme(axis.text = element_text(size = 12, face="bold"),
+        axis.title=element_text(size=12, face="bold")) +
+  theme(legend.text=element_text(size=10, face="bold")) +
+  guides(size = "none")
+  
+ggsave("gpq.tiff", width = 2187, height = 1351, units = "px", dpi=300)
+gpq_plot
+```
+
+
+```{r}
+# Save combined plot for DAS28-CRP and GPQ
+
+ggarrange(das28_plot, gpq_plot, 
+          ncol = 1, nrow = 2) %>% 
+    ggexport(filename = "das28_crp_gpq.tiff", 
+           height = 2702, width = 2187,
+           res = 300)
+
+```
+
+
+
+
+
+
+
+
